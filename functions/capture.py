@@ -371,8 +371,17 @@ class WebcamCapturer:
                                     track_stats=track_stats
                                 )
                                 ocr_duration = time.time() - ocr_start_time
-
-                                final_text = f"--- Left Page ---\n{text_l}\n\n--- Right Page ---\n{text_r}"
+                                from functions.ocr.pipeline import reconstruct_paragraphs
+                                paragraphs_l, last_is_open = reconstruct_paragraphs(results_l, self.config, is_left_page=True)
+                                paragraphs_r, _ = reconstruct_paragraphs(results_r, self.config, is_left_page=False)
+                                
+                                if last_is_open and paragraphs_l and paragraphs_r:
+                                    merged_para = paragraphs_l[-1] + " " + paragraphs_r[0]
+                                    paragraphs = paragraphs_l[:-1] + [merged_para] + paragraphs_r[1:]
+                                else:
+                                    paragraphs = paragraphs_l + paragraphs_r
+                                
+                                final_text = "\n\n".join(paragraphs)
 
                                 # Construct bbox.txt content for split page mode
                                 bbox_lines = []
@@ -447,25 +456,37 @@ class WebcamCapturer:
                                 f.write(bbox_text)
                             print(f"💾 Bounding box text saved to: {bbox_save_path}")
 
-                            # Save text payload to stream/ocr_result.json for the GUI monitor
+                            # Save text payload to stream/page_{page_num:04d}.json and update stream/metadata.json atomically
                             try:
                                 import json
                                 func_dir = os.path.dirname(os.path.abspath(__file__))
                                 proj_root = os.path.dirname(func_dir)
                                 stream_dir = os.path.join(proj_root, "stream")
                                 os.makedirs(stream_dir, exist_ok=True)
-                                json_path = os.path.join(stream_dir, "ocr_result.json")
                                 
+                                page_json_path = os.path.join(stream_dir, f"page_{self.capture_count:04d}.json")
                                 payload = {
                                     "capture_id": f"{self.session_timestamp}_{self.capture_count:04d}",
                                     "text": final_text,
                                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                                 }
-                                with open(json_path, 'w', encoding='utf-8') as f:
+                                with open(page_json_path, 'w', encoding='utf-8') as f:
                                     json.dump(payload, f, ensure_ascii=False, indent=4)
-                                print(f"💾 Saved real-time monitor payload to: {json_path}")
+                                print(f"💾 Saved page payload to: {page_json_path}")
+                                
+                                # Write metadata.json atomically using temp file and replace
+                                meta_path = os.path.join(stream_dir, "metadata.json")
+                                temp_meta_path = os.path.join(stream_dir, "metadata.tmp.json")
+                                meta_payload = {
+                                    "latest_page": self.capture_count,
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                                }
+                                with open(temp_meta_path, 'w', encoding='utf-8') as f:
+                                    json.dump(meta_payload, f, ensure_ascii=False, indent=4)
+                                os.replace(temp_meta_path, meta_path)
+                                print(f"💾 Atomically updated metadata to: {meta_path}")
                             except Exception as e:
-                                print(f"WARNING: Failed to save monitor JSON payload: {e}")
+                                print(f"WARNING: Failed to save monitor JSON payload or metadata: {e}")
 
                             if track_stats:
                                 print(f" - Pure OCR Time: {ocr_duration:.2f}s")

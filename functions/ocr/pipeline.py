@@ -145,6 +145,144 @@ def draw_and_save(image_np: np.ndarray, results: list, output_path: str, verbose
     if verbose:
         print(f" -> Result visualization saved to: {output_path}")
 
+def reconstruct_paragraphs(results: list, config: dict, is_left_page: bool = False) -> Tuple[List[str], bool]:
+    """
+    Groups OCR bounding boxes into lines, sorts them, detects paragraph breaks
+    based on layout properties (line width and vertical gaps), and applies spacing correction.
+    
+    Returns:
+        (paragraphs_list, last_is_open_bool)
+    """
+    if not results:
+        return [], False
+    
+    valid_items = []
+    for res in results:
+        if len(res) >= 2 and res[0] is not None and len(res[0]) >= 4:
+            text = res[1]
+            if isinstance(text, tuple):
+                text = text[0]
+            if text.strip():
+                bbox = res[0]
+                xs = [p[0] for p in bbox]
+                ys = [p[1] for p in bbox]
+                x_left, x_right = min(xs), max(xs)
+                y_top, y_bottom = min(ys), max(ys)
+                height = y_bottom - y_top
+                width = x_right - x_left
+                valid_items.append({
+                    'text': text,
+                    'x_left': x_left,
+                    'x_right': x_right,
+                    'y_top': y_top,
+                    'y_bottom': y_bottom,
+                    'height': height,
+                    'width': width
+                })
+                
+    if not valid_items:
+        return [], False
+        
+    # Sort items top-to-bottom
+    valid_items.sort(key=lambda item: item['y_top'])
+    
+    # Group into lines
+    lines = []
+    for item in valid_items:
+        placed = False
+        for line in lines:
+            line_y_top = min(it['y_top'] for it in line)
+            line_y_bottom = max(it['y_bottom'] for it in line)
+            line_height = line_y_bottom - line_y_top
+            
+            overlap = min(item['y_bottom'], line_y_bottom) - max(item['y_top'], line_y_top)
+            min_h = min(item['height'], line_height)
+            if min_h > 0 and overlap > 0.45 * min_h:
+                line.append(item)
+                placed = True
+                break
+        if not placed:
+            lines.append([item])
+            
+    # Sort lines by y_top
+    lines.sort(key=lambda line: min(item['y_top'] for item in line))
+    
+    # Sort items within each line left-to-right
+    for line in lines:
+        line.sort(key=lambda item: item['x_left'])
+        
+    # Merge line representations
+    merged_lines = []
+    for line in lines:
+        line_text = " ".join(item['text'] for item in line)
+        line_x_left = min(item['x_left'] for item in line)
+        line_x_right = max(item['x_right'] for item in line)
+        line_y_top = min(item['y_top'] for item in line)
+        line_y_bottom = max(item['y_bottom'] for item in line)
+        merged_lines.append({
+            'text': line_text,
+            'x_left': line_x_left,
+            'x_right': line_x_right,
+            'y_top': line_y_top,
+            'y_bottom': line_y_bottom,
+            'height': line_y_bottom - line_y_top,
+            'width': line_x_right - line_x_left
+        })
+        
+    # Find paragraph breaks
+    widths = [line['width'] for line in merged_lines]
+    max_width = max(widths) if widths else 1.0
+    
+    paragraphs = []
+    current_para = []
+    last_is_open = False
+    
+    for i, line in enumerate(merged_lines):
+        current_para.append(line['text'])
+        
+        is_para_end = False
+        if i == len(merged_lines) - 1:
+            if is_left_page:
+                # For the last line of the left page, check if it meets the criteria of paragraph end
+                is_para_end = False
+                if line['width'] < 0.82 * max_width:
+                    text_stripped = line['text'].strip()
+                    if text_stripped and text_stripped[-1] in ('.', '?', '!', '"', '”', '`', '’'):
+                        is_para_end = True
+                    elif line['width'] < 0.70 * max_width:
+                        is_para_end = True
+                if not is_para_end:
+                    last_is_open = True
+            else:
+                is_para_end = True
+        else:
+            next_line = merged_lines[i+1]
+            gap = next_line['y_top'] - line['y_bottom']
+            if gap > 1.45 * line['height']:
+                is_para_end = True
+            elif line['width'] < 0.82 * max_width:
+                text_stripped = line['text'].strip()
+                if text_stripped and text_stripped[-1] in ('.', '?', '!', '"', '”', '`', '’'):
+                    is_para_end = True
+                elif line['width'] < 0.70 * max_width:
+                    is_para_end = True
+                    
+        if is_para_end or (i == len(merged_lines) - 1):
+            # Combine items of current paragraph
+            para_text = " ".join(current_para)
+            
+            # Spacing correction on this paragraph
+            pp_cfg = config.get('post_process', {})
+            if pp_cfg.get('kiwi_spacing', False):
+                kiwi = get_kiwi()
+                if kiwi:
+                    para_text = kiwi.space(para_text, reset_whitespace=pp_cfg.get('reset_whitespace', True))
+            
+            paragraphs.append(para_text)
+            current_para = []
+            
+    return paragraphs, last_is_open
+
 def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, track_stats: bool = False) -> Tuple[list, Image.Image, str, dict]:
     """
     Executes the complete OCR pipeline.
@@ -181,15 +319,9 @@ def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, trac
         output_np = engine.last_preprocessed_image
         image_pil = Image.fromarray(cv2.cvtColor(output_np, cv2.COLOR_BGR2RGB))
     
-    # 3. Post-process text
-    pp_cfg = config.get('post_process', {})
-    full_text = " ".join([res[1] for res in results if len(res) >= 2])
-    
-    final_text = full_text
-    if pp_cfg.get('kiwi_spacing', False):
-        kiwi = get_kiwi()
-        if kiwi:
-            final_text = kiwi.space(full_text, reset_whitespace=pp_cfg.get('reset_whitespace', True))
+    # 3. Post-process text using paragraph reconstruction
+    paragraphs, _ = reconstruct_paragraphs(results, config, is_left_page=False)
+    final_text = "\n\n".join(paragraphs)
             
     stats = {}
     if track_stats:

@@ -21,13 +21,18 @@ class PaddleOCREngine(OCREngine):
         ocr_cfg = config.get('ocr', {})
         # Map languages to PaddleOCR expected format
         lang = 'korean' if 'ko' in ocr_cfg.get('languages', []) else 'en'
+        use_gpu = ocr_cfg.get('gpu', True)
+        device_str = "gpu" if use_gpu else "cpu"
+        use_orientation = ocr_cfg.get('orientation_classify', False)
+        use_doc_unwarping = ocr_cfg.get('doc_unwarping', False)
         
         # Note: Model path is handled via HOME environment variable set in pipeline.py/ocr.py
         self.ocr = PaddleOCR(
             use_textline_orientation=True, 
             lang=lang,
-            use_doc_orientation_classify=True,
-            use_doc_unwarping=True
+            use_doc_orientation_classify=use_orientation,
+            use_doc_unwarping=use_doc_unwarping,
+            device=device_str,
         )
         self.last_preprocessed_image = None
 

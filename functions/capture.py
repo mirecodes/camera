@@ -2,11 +2,14 @@
 import os
 import sys
 import time
+import queue
+import json
+import multiprocessing
+from collections import deque
 import cv2
 import yaml
 import numpy as np
 import ssl
-import layoutparser as lp
 
 # Bypass SSL certificates verification for model downloads (crucial for macOS environments)
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -49,16 +52,24 @@ class WebcamCapturer:
         os.makedirs(self.session_dir, exist_ok=True)
         self.capture_count = 0
 
-        # Load LayoutParser model (ppyolov2_r50vd_dcn_365e_publaynet)
-        print("Loading LayoutParser model (ppyolov2)...")
-        try:
-            self.layout_model = lp.PaddleDetectionLayoutModel(
-                'lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config'
-            )
-            print("LayoutParser model loaded successfully.")
-        except Exception as e:
-            print(f"WARNING: Failed to load LayoutParser model: {e}. Fallback to manual split.", file=sys.stderr)
-            self.layout_model = None
+        # Load configurable max frames from config to setup rolling frame buffer
+        enhance_cfg = self.config.get('enhancement', {})
+        stacking_cfg = enhance_cfg.get('stacking', {})
+        self.max_frames = max(2, int(stacking_cfg.get('max_frames', 50)))
+
+        # Async Multiprocessing Queue & Worker State
+        self.task_queue = multiprocessing.Queue()
+        self.status_queue = multiprocessing.Queue()
+        self.q_size = 0
+        self.processing_status = "Idle"
+        
+        # Start background worker process
+        self.worker_process = multiprocessing.Process(
+            target=self.processing_worker_proc, 
+            args=(self.task_queue, self.status_queue, self.config, self.session_dir, self.session_timestamp), 
+            daemon=True
+        )
+        self.worker_process.start()
 
     def load_config(self):
         if not os.path.exists(self.config_path):
@@ -72,7 +83,8 @@ class WebcamCapturer:
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         return laplacian_var, laplacian_var < threshold
 
-    def find_dynamic_split_line(self, layout_result, img_width):
+    @staticmethod
+    def find_dynamic_split_line(layout_result, img_width):
         """
         Dynamically finds the optimal vertical line to split a double-page document spread
         based on the horizontal distribution (histogram) of detected text blocks.
@@ -127,7 +139,7 @@ class WebcamCapturer:
 
     def run(self, record_stream=False):
         """
-        Runs the webcam live stream.
+        Runs the webcam live stream with instant non-blocking capture and overlay metrics.
         :param record_stream: If True, saves the entire stream to video_output_path.
         """
         print(f"Opening camera index {self.camera_index}...")
@@ -156,10 +168,8 @@ class WebcamCapturer:
         print(" - Press 'q' on the video window to QUIT.")
         print("========================\n")
         
-        # Load configurable max frames from config
-        enhance_cfg = self.config.get('enhancement', {})
-        stacking_cfg = enhance_cfg.get('stacking', {})
-        max_frames_cfg = max(2, int(stacking_cfg.get('max_frames', 50)))
+        # Initialize rolling frame buffer
+        frame_buffer = deque(maxlen=self.max_frames)
         
         try:
             while True:
@@ -168,10 +178,33 @@ class WebcamCapturer:
                     print("Error: Failed to grab frame.", file=sys.stderr)
                     break
 
+                # Maintain history of frames for stacking
+                frame_buffer.append(frame.copy())
+
+                # Check for worker status updates non-blockingly
+                try:
+                    while not self.status_queue.empty():
+                        status = self.status_queue.get_nowait()
+                        if status[0] == "done":
+                            self.q_size = max(0, self.q_size - 1)
+                            self.processing_status = "Idle"
+                        elif status[0] == "started":
+                            self.processing_status = f"Processing #{status[1]}"
+                except Exception:
+                    pass
+
                 # Draw info overlay on a copy for display (optional)
                 display_frame = frame.copy()
+                
+                # Overlay layout
                 cv2.putText(display_frame, "Press 'c' to Capture & Stack | 'q' to Quit", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Print queue size and processing status
+                status_color = (0, 255, 255) if self.q_size > 0 else (0, 255, 0)
+                status_msg = f"Queue Size: {self.q_size} | Worker: {self.processing_status}"
+                cv2.putText(display_frame, status_msg, (10, 65),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
                 # Show stream
                 cv2.imshow('Webcam Live Stream', display_frame)
@@ -183,320 +216,23 @@ class WebcamCapturer:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     print("Quit command received.")
+                    # Put sentinel to stop worker process
+                    self.task_queue.put(None)
                     break
                 elif key == ord('c') or key == ord('s'):
-                    # Stacking Capture Triggered!
-                    capture_dir = os.path.join(self.session_dir, f"{self.capture_count:04d}")
-                    os.makedirs(capture_dir, exist_ok=True)
-                    
-                    raw_save_path = os.path.join(capture_dir, "raw.png")
-                    enhanced_save_path = os.path.join(capture_dir, "enhanced.png")
-                    
-                    print(f"\n[Stacking Capture] Gathering {max_frames_cfg} frames from this moment...")
-                    
-                    # Gather frames starting now
-                    captured_frames = []
-                    
-                    for _ in range(max_frames_cfg):
-                        ret_f, f = cap.read()
-                        if ret_f:
-                            captured_frames.append(f)
-                            # Display overlay status on the window
-                            overlay = f.copy()
-                            cv2.putText(overlay, f"Capturing: {len(captured_frames)}/{max_frames_cfg}", (10, 30),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                            cv2.imshow('Webcam Live Stream', overlay)
-                            cv2.waitKey(1)
-
-                    # Merge frames in grayscale
-                    all_stack_frames = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in captured_frames]
-                    
-                    if len(all_stack_frames) > 0:
-                        enhance_cfg = self.config.get('enhancement', {})
-                        stacking_cfg = enhance_cfg.get('stacking', {})
-                        scale = max(1, int(stacking_cfg.get('scale_factor', 2)))
-                        
-                        print(f"Aligning and Stacking {len(all_stack_frames)} frames using ECC at {scale}x resolution...")
-                        
-                        ref_idx = int(np.argmax([cv2.Laplacian(img, cv2.CV_64F).var() for img in all_stack_frames]))
-                        ref_frame = all_stack_frames[ref_idx]
-                        print(f" -> Chosen frame {ref_idx}/{len(all_stack_frames)} as reference (Sharpness: {cv2.Laplacian(ref_frame, cv2.CV_64F).var():.2f})")
-                        
-                        # Save raw image
-                        cv2.imwrite(raw_save_path, captured_frames[ref_idx])
-                        print(f"💾 Saved raw reference frame to: {raw_save_path}")
-                        
-                        h, w = ref_frame.shape
-                        
-                        h_scaled, w_scaled = h * scale, w * scale
-                        stacked_float_scaled = np.zeros((h_scaled, w_scaled), dtype=np.float32)
-                        
-                        ref_frame_scaled = cv2.resize(ref_frame, (w_scaled, h_scaled), interpolation=cv2.INTER_LANCZOS4)
-                        stacked_float_scaled += ref_frame_scaled.astype(np.float32)
-                        
-                        aligned_count = 1
-                        warp_mode = cv2.MOTION_EUCLIDEAN
-                        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
-                        
-                        for idx in range(1, len(all_stack_frames)):
-                            curr_frame = all_stack_frames[idx]
-                            warp_matrix = np.eye(2, 3, dtype=np.float32)
-                            try:
-                                cc, warp_matrix = cv2.findTransformECC(
-                                    ref_frame,
-                                    curr_frame,
-                                    warp_matrix,
-                                    warp_mode,
-                                    criteria,
-                                    None,
-                                    5
-                                )
-                                warp_matrix_scaled = warp_matrix.copy()
-                                warp_matrix_scaled[0, 2] *= float(scale)
-                                warp_matrix_scaled[1, 2] *= float(scale)
-                                
-                                curr_frame_scaled = cv2.resize(curr_frame, (w_scaled, h_scaled), interpolation=cv2.INTER_LANCZOS4)
-                                
-                                aligned_frame_scaled = cv2.warpAffine(
-                                    curr_frame_scaled,
-                                    warp_matrix_scaled,
-                                    (w_scaled, h_scaled),
-                                    flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
-                                    borderMode=cv2.BORDER_REPLICATE
-                                )
-                                stacked_float_scaled += aligned_frame_scaled.astype(np.float32)
-                                aligned_count += 1
-                            except cv2.error:
-                                continue
-                                
-                        print(f" -> Successfully aligned {aligned_count}/{len(all_stack_frames)} frames.")
-                        stacked_scaled = stacked_float_scaled / aligned_count
-                        stacked_scaled = np.clip(stacked_scaled, 0, 255).astype(np.uint8)
-
-                        # Apply sharpening if enabled in configuration
-                        if enhance_cfg.get('enabled', True) and enhance_cfg.get('sharpening', True):
-                            strength = enhance_cfg.get('strength', 'strong')
-                            if strength == "unsharp":
-                                print("Applying CLAHE and unsharp masking filter to stacked image...")
-                                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                                clahe_scaled = clahe.apply(stacked_scaled)
-                                ksize = 5 if scale <= 2 else (9 if scale == 3 else 13)
-                                gaussian_blur = cv2.GaussianBlur(clahe_scaled, (ksize, ksize), 1.5)
-                                process_frame = cv2.addWeighted(clahe_scaled, 2.2, gaussian_blur, -1.2, 0)
-                            else:
-                                print(f"Applying real-time {strength} sharpening to stacked image...")
-                                if strength == "strong":
-                                    kernel = np.array([
-                                        [-1, -1, -1],
-                                        [-1,  9, -1],
-                                        [-1, -1, -1]
-                                    ])
-                                else:
-                                    kernel = np.array([
-                                        [ 0, -1,  0],
-                                        [-1,  5, -1],
-                                        [ 0, -1,  0]
-                                    ])
-                                process_frame = cv2.filter2D(stacked_scaled, -1, kernel)
-                        else:
-                            process_frame = stacked_scaled
-
-                        # Save high resolution frame
-                        cv2.imwrite(enhanced_save_path, process_frame, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
-                        print(f"💾 Saved stacked & sharpened frame to: {enhanced_save_path}")
-
-                        # Run Layout-aware splitting and OCR
-                        print("Running Document AI layout analysis & split on captured frame...")
-                        try:
-                            from functions.ocr.pipeline import run_ocr_pipeline, draw_and_save
-
-                            verbose = self.config.get('logging', {}).get('verbose', True)
-                            track_stats = self.config.get('logging', {}).get('resource_tracking', True)
-
-                            # Check config toggle for dynamic split
-                            use_dynamic_split = self.config.get('layout', {}).get('dynamic_split', True)
-
-                            if use_dynamic_split:
-                                h_proc, w_proc = process_frame.shape[:2]
-                                split_x = w_proc // 2
-                                y1, y2 = int(h_proc * 0.12), int(h_proc * 0.88)
-                                detection_success = False
-
-                                if self.layout_model is not None:
-                                    try:
-                                        layout = self.layout_model.detect(process_frame)
-                                        split_x = self.find_dynamic_split_line(layout, w_proc)
-                                        accepted_types = {'text', 'paragraph', 'body'}
-                                        body_blocks = [b for b in layout if b.type.lower() in accepted_types]
-                                        if body_blocks:
-                                            y1_list = [int(b.coordinates[1]) for b in body_blocks]
-                                            y2_list = [int(b.coordinates[3]) for b in body_blocks]
-                                            y1 = max(0, min(y1_list))
-                                            y2 = min(h_proc, max(y2_list))
-                                            detection_success = True
-                                            print(f"[LayoutParser] Detected main content bounds: y1={y1}, y2={y2}")
-                                        else:
-                                            print("[LayoutParser] No body blocks detected. Using fallback vertical bounds.")
-                                    except Exception as e:
-                                        print(f"WARNING: LayoutParser detection failed: {e}. Using fallback bounds.")
-                                else:
-                                    print("[LayoutParser] Layout model not loaded. Using fallback split and vertical bounds.")
-
-                                # Slice into Left and Right cropped regions
-                                left_cropped = process_frame[y1:y2, 0:split_x]
-                                right_cropped = process_frame[y1:y2, split_x:w_proc]
-
-                                # Save page crops
-                                left_crop_path = os.path.join(capture_dir, "left.png")
-                                right_crop_path = os.path.join(capture_dir, "right.png")
-                                cv2.imwrite(left_crop_path, left_cropped)
-                                cv2.imwrite(right_crop_path, right_cropped)
-                                print(f"💾 Saved left page crop to: {left_crop_path}")
-                                print(f"💾 Saved right page crop to: {right_crop_path}")
-
-                                # Run OCR sequentially
-                                ocr_start_time = time.time()
-                                print("[OCR] Running PaddleOCR on Left Page...")
-                                results_l, prep_l, text_l, stats_l = run_ocr_pipeline(
-                                    left_cropped,
-                                    self.config,
-                                    verbose=verbose,
-                                    track_stats=track_stats
-                                )
-                                print("[OCR] Running PaddleOCR on Right Page...")
-                                results_r, prep_r, text_r, stats_r = run_ocr_pipeline(
-                                    right_cropped,
-                                    self.config,
-                                    verbose=verbose,
-                                    track_stats=track_stats
-                                )
-                                ocr_duration = time.time() - ocr_start_time
-                                from functions.ocr.pipeline import reconstruct_paragraphs
-                                paragraphs_l, last_is_open = reconstruct_paragraphs(results_l, self.config, is_left_page=True)
-                                paragraphs_r, _ = reconstruct_paragraphs(results_r, self.config, is_left_page=False)
-                                
-                                if last_is_open and paragraphs_l and paragraphs_r:
-                                    merged_para = paragraphs_l[-1] + " " + paragraphs_r[0]
-                                    paragraphs = paragraphs_l[:-1] + [merged_para] + paragraphs_r[1:]
-                                else:
-                                    paragraphs = paragraphs_l + paragraphs_r
-                                
-                                final_text = "\n\n".join(paragraphs)
-
-                                # Construct bbox.txt content for split page mode
-                                bbox_lines = []
-                                bbox_lines.append("--- Left Page ---")
-                                if results_l:
-                                    for i, res in enumerate(results_l, 1):
-                                        bbox_lines.append(f'{i}: "{res[1]}"')
-                                else:
-                                    bbox_lines.append("[No text detected]")
-                                bbox_lines.append("")
-                                bbox_lines.append("--- Right Page ---")
-                                if results_r:
-                                    for i, res in enumerate(results_r, 1):
-                                        bbox_lines.append(f'{i}: "{res[1]}"')
-                                else:
-                                    bbox_lines.append("[No text detected]")
-                                bbox_text = "\n".join(bbox_lines)
-
-                                # Save marked/context images if configured
-                                if self.config.get('logging', {}).get('save_marked', True):
-                                    if results_l:
-                                        left_marked_path = os.path.join(capture_dir, "left_context.png")
-                                        draw_and_save(np.array(prep_l), results_l, left_marked_path, verbose=verbose)
-                                    if results_r:
-                                        right_marked_path = os.path.join(capture_dir, "right_context.png")
-                                        draw_and_save(np.array(prep_r), results_r, right_marked_path, verbose=verbose)
-                            else:
-                                # Single page mode (No splitting)
-                                print("[OCR] Running single-page mode (dynamic split disabled)...")
-                                ocr_start_time = time.time()
-                                results, prep, final_text, stats = run_ocr_pipeline(
-                                    process_frame,
-                                    self.config,
-                                    verbose=verbose,
-                                    track_stats=track_stats
-                                )
-                                ocr_duration = time.time() - ocr_start_time
-
-                                # Construct bbox.txt content for single page mode
-                                bbox_lines = []
-                                if results:
-                                    for i, res in enumerate(results, 1):
-                                        bbox_lines.append(f'{i}: "{res[1]}"')
-                                else:
-                                    bbox_lines.append("[No text detected]")
-                                bbox_text = "\n".join(bbox_lines)
-
-                                # Save marked/context image if configured
-                                if self.config.get('logging', {}).get('save_marked', True) and results:
-                                    marked_path = os.path.join(capture_dir, "context.png")
-                                    draw_and_save(np.array(prep), results, marked_path, verbose=verbose)
-
-                            # Print OCR result to terminal
-                            print("\n" + "="*40)
-                            print("★ OCR RESULT ★")
-                            print("="*40)
-                            if final_text.strip():
-                                print(final_text)
-                            else:
-                                print("[No text detected]")
-                            print("="*40 + "\n")
-
-                            # Save OCR result to txt file
-                            txt_save_path = os.path.join(capture_dir, "ocr.txt")
-                            with open(txt_save_path, 'w', encoding='utf-8') as f:
-                                f.write(final_text)
-                            print(f"💾 OCR text saved to: {txt_save_path}")
-
-                            # Save bounding boxes text file
-                            bbox_save_path = os.path.join(capture_dir, "bbox.txt")
-                            with open(bbox_save_path, 'w', encoding='utf-8') as f:
-                                f.write(bbox_text)
-                            print(f"💾 Bounding box text saved to: {bbox_save_path}")
-
-                            # Save text payload to stream/page_{page_num:04d}.json and update stream/metadata.json atomically
-                            try:
-                                import json
-                                func_dir = os.path.dirname(os.path.abspath(__file__))
-                                proj_root = os.path.dirname(func_dir)
-                                stream_dir = os.path.join(proj_root, "stream")
-                                os.makedirs(stream_dir, exist_ok=True)
-                                
-                                page_json_path = os.path.join(stream_dir, f"page_{self.capture_count:04d}.json")
-                                payload = {
-                                    "capture_id": f"{self.session_timestamp}_{self.capture_count:04d}",
-                                    "text": final_text,
-                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                                }
-                                with open(page_json_path, 'w', encoding='utf-8') as f:
-                                    json.dump(payload, f, ensure_ascii=False, indent=4)
-                                print(f"💾 Saved page payload to: {page_json_path}")
-                                
-                                # Write metadata.json atomically using temp file and replace
-                                meta_path = os.path.join(stream_dir, "metadata.json")
-                                temp_meta_path = os.path.join(stream_dir, "metadata.tmp.json")
-                                meta_payload = {
-                                    "latest_page": self.capture_count,
-                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                                }
-                                with open(temp_meta_path, 'w', encoding='utf-8') as f:
-                                    json.dump(meta_payload, f, ensure_ascii=False, indent=4)
-                                os.replace(temp_meta_path, meta_path)
-                                print(f"💾 Atomically updated metadata to: {meta_path}")
-                            except Exception as e:
-                                print(f"WARNING: Failed to save monitor JSON payload or metadata: {e}")
-
-                            if track_stats:
-                                print(f" - Pure OCR Time: {ocr_duration:.2f}s")
-
-                        except Exception as e:
-                            print(f"Failed to run OCR layout split pipeline: {e}", file=sys.stderr)
+                    # Capture current snapshot of the rolling frames
+                    captured_frames = list(frame_buffer)
+                    if len(captured_frames) > 0:
+                        task_info = {
+                            'capture_index': self.capture_count,
+                            'frames': captured_frames
+                        }
+                        self.task_queue.put(task_info)
+                        self.q_size += 1
+                        print(f"[Queue] Enqueued capture #{self.capture_count} (Queue Size: {self.q_size})")
+                        self.capture_count += 1
                     else:
-                        print("Error: No frames collected for stacking.", file=sys.stderr)
-
-                    self.capture_count += 1
+                        print("Error: Frame buffer is empty, cannot capture.", file=sys.stderr)
                     
         finally:
             cap.release()
@@ -505,3 +241,308 @@ class WebcamCapturer:
             cv2.destroyAllWindows()
             print("Resources released. Stream stopped.")
 
+    @staticmethod
+    def processing_worker_proc(task_queue, status_queue, config, session_dir, session_timestamp):
+        """Worker process function: runs entirely in a separate OS process to bypass the GIL."""
+        while True:
+            try:
+                task = task_queue.get()
+                if task is None:
+                    break
+                
+                capture_index = task['capture_index']
+                captured_frames = task['frames']
+                
+                status_queue.put(("started", capture_index))
+                WebcamCapturer.execute_capture_task(capture_index, captured_frames, config, session_dir, session_timestamp)
+                status_queue.put(("done", capture_index))
+            except Exception as e:
+                print(f"[Worker Process Error] Failed to process capture: {e}", file=sys.stderr)
+
+    @staticmethod
+    def execute_capture_task(capture_index, captured_frames, config, session_dir, session_timestamp):
+        """Executes the heavy stacking, alignment, layout detection, and OCR in the background."""
+        capture_dir = os.path.join(session_dir, f"{capture_index:04d}")
+        os.makedirs(capture_dir, exist_ok=True)
+        
+        raw_save_path = os.path.join(capture_dir, "raw.png")
+        enhanced_save_path = os.path.join(capture_dir, "enhanced.png")
+        
+        if len(captured_frames) > 0:
+            enhance_cfg = config.get('enhancement', {})
+            stacking_cfg = enhance_cfg.get('stacking', {})
+            stacking_enabled = stacking_cfg.get('enabled', True)
+            scale = max(1, int(stacking_cfg.get('scale_factor', 2)))
+            
+            if stacking_enabled and len(captured_frames) > 1:
+                # Merge frames in grayscale
+                all_stack_frames = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in captured_frames]
+                print(f"\n[Stacking - Async #{capture_index}] Aligning and Stacking {len(all_stack_frames)} frames using ECC...")
+                
+                ref_idx = int(np.argmax([cv2.Laplacian(img, cv2.CV_64F).var() for img in all_stack_frames]))
+                ref_frame = all_stack_frames[ref_idx]
+                
+                # Save raw image
+                cv2.imwrite(raw_save_path, captured_frames[ref_idx])
+                print(f"💾 Saved raw reference frame to: {raw_save_path}")
+                
+                h, w = ref_frame.shape
+                h_scaled, w_scaled = h * scale, w * scale
+                stacked_float_scaled = np.zeros((h_scaled, w_scaled), dtype=np.float32)
+                
+                ref_frame_scaled = cv2.resize(ref_frame, (w_scaled, h_scaled), interpolation=cv2.INTER_LANCZOS4)
+                stacked_float_scaled += ref_frame_scaled.astype(np.float32)
+                
+                aligned_count = 1
+                warp_mode = cv2.MOTION_EUCLIDEAN
+                criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
+                
+                for idx in range(1, len(all_stack_frames)):
+                    curr_frame = all_stack_frames[idx]
+                    warp_matrix = np.eye(2, 3, dtype=np.float32)
+                    try:
+                        cc, warp_matrix = cv2.findTransformECC(
+                            ref_frame,
+                            curr_frame,
+                            warp_matrix,
+                            warp_mode,
+                            criteria,
+                            None,
+                            5
+                        )
+                        warp_matrix_scaled = warp_matrix.copy()
+                        warp_matrix_scaled[0, 2] *= float(scale)
+                        warp_matrix_scaled[1, 2] *= float(scale)
+                        
+                        curr_frame_scaled = cv2.resize(curr_frame, (w_scaled, h_scaled), interpolation=cv2.INTER_LANCZOS4)
+                        
+                        aligned_frame_scaled = cv2.warpAffine(
+                            curr_frame_scaled,
+                            warp_matrix_scaled,
+                            (w_scaled, h_scaled),
+                            flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                            borderMode=cv2.BORDER_REPLICATE
+                        )
+                        stacked_float_scaled += aligned_frame_scaled.astype(np.float32)
+                        aligned_count += 1
+                    except cv2.error:
+                        continue
+                        
+                print(f" -> Successfully aligned {aligned_count}/{len(all_stack_frames)} frames.")
+                stacked_scaled = stacked_float_scaled / aligned_count
+                stacked_scaled = np.clip(stacked_scaled, 0, 255).astype(np.uint8)
+            else:
+                # Stacking disabled: use the last captured frame
+                print(f"\n[Stacking - Async #{capture_index}] Stacking disabled. Using single frame.")
+                single_frame = captured_frames[-1]
+                cv2.imwrite(raw_save_path, single_frame)
+                print(f"💾 Saved raw single frame to: {raw_save_path}")
+                
+                gray_frame = cv2.cvtColor(single_frame, cv2.COLOR_BGR2GRAY)
+                h, w = gray_frame.shape
+                h_scaled, w_scaled = h * scale, w * scale
+                stacked_scaled = cv2.resize(gray_frame, (w_scaled, h_scaled), interpolation=cv2.INTER_LANCZOS4)
+
+            # Apply sharpening if enabled in configuration
+            if enhance_cfg.get('enabled', True) and enhance_cfg.get('sharpening', True):
+                strength = enhance_cfg.get('strength', 'strong')
+                if strength == "unsharp":
+                    print("Applying CLAHE and unsharp masking filter to stacked image...")
+                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                    clahe_scaled = clahe.apply(stacked_scaled)
+                    ksize = 5 if scale <= 2 else (9 if scale == 3 else 13)
+                    gaussian_blur = cv2.GaussianBlur(clahe_scaled, (ksize, ksize), 1.5)
+                    process_frame = cv2.addWeighted(clahe_scaled, 2.2, gaussian_blur, -1.2, 0)
+                else:
+                    print(f"Applying real-time {strength} sharpening to stacked image...")
+                    if strength == "strong":
+                        kernel = np.array([
+                            [-1, -1, -1],
+                            [-1,  9, -1],
+                            [-1, -1, -1]
+                        ])
+                    else:
+                        kernel = np.array([
+                            [ 0, -1,  0],
+                            [-1,  5, -1],
+                            [ 0, -1,  0]
+                        ])
+                    process_frame = cv2.filter2D(stacked_scaled, -1, kernel)
+            else:
+                process_frame = stacked_scaled
+
+            # Save enhanced frame
+            cv2.imwrite(enhanced_save_path, process_frame, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+            print(f"💾 Saved stacked & sharpened frame to: {enhanced_save_path}")
+
+            # Run Layout-aware splitting and OCR
+            print("Running Document AI layout analysis & split on captured frame...")
+            try:
+                from functions.ocr.pipeline import run_ocr_pipeline, draw_and_save
+
+                verbose = config.get('logging', {}).get('verbose', True)
+                track_stats = config.get('logging', {}).get('resource_tracking', True)
+
+                # Check config toggle for dynamic split
+                use_dynamic_split = config.get('layout', {}).get('dynamic_split', True)
+
+                if use_dynamic_split:
+                    h_proc, w_proc = process_frame.shape[:2]
+                    split_x = w_proc // 2
+                    
+                    # Fix: Keep full height (0 to h_proc) to prevent cutting text at the top and bottom
+                    y1, y2 = 0, h_proc
+
+                    # Slice into Left and Right cropped regions without central margins or vertical margins
+                    left_cropped = process_frame[y1:y2, 0:split_x]
+                    right_cropped = process_frame[y1:y2, split_x:w_proc]
+
+                    # Save page crops
+                    left_crop_path = os.path.join(capture_dir, "left.png")
+                    right_crop_path = os.path.join(capture_dir, "right.png")
+                    cv2.imwrite(left_crop_path, left_cropped)
+                    print(f"💾 Saved left page crop to: {left_crop_path}")
+                    cv2.imwrite(right_crop_path, right_cropped)
+                    print(f"💾 Saved right page crop to: {right_crop_path}")
+
+                    # Run OCR sequentially
+                    ocr_start_time = time.time()
+                    print("[OCR] Running PaddleOCR on Left Page...")
+                    results_l, prep_l, text_l, stats_l = run_ocr_pipeline(
+                        left_cropped,
+                        config,
+                        verbose=verbose,
+                        track_stats=track_stats
+                    )
+                    print("[OCR] Running PaddleOCR on Right Page...")
+                    results_r, prep_r, text_r, stats_r = run_ocr_pipeline(
+                        right_cropped,
+                        config,
+                        verbose=verbose,
+                        track_stats=track_stats
+                    )
+                    ocr_duration = time.time() - ocr_start_time
+
+                    from functions.ocr.pipeline import reconstruct_paragraphs
+                    paragraphs_l, last_is_open = reconstruct_paragraphs(results_l, config, is_left_page=True, image_height=left_cropped.shape[0])
+                    paragraphs_r, _ = reconstruct_paragraphs(results_r, config, is_left_page=False, image_height=right_cropped.shape[0])
+                    
+                    if last_is_open and paragraphs_l and paragraphs_r:
+                        merged_para = paragraphs_l[-1] + " " + paragraphs_r[0]
+                        paragraphs = paragraphs_l[:-1] + [merged_para] + paragraphs_r[1:]
+                    else:
+                        paragraphs = paragraphs_l + paragraphs_r
+                    
+                    final_text = "\n\n".join(paragraphs)
+
+                    # Construct bbox.txt content for split page mode
+                    bbox_lines = []
+                    bbox_lines.append("--- Left Page ---")
+                    if results_l:
+                        for i, res in enumerate(results_l, 1):
+                            bbox_lines.append(f'{i}: "{res[1]}"')
+                    else:
+                        bbox_lines.append("[No text detected]")
+                    bbox_lines.append("")
+                    bbox_lines.append("--- Right Page ---")
+                    if results_r:
+                        for i, res in enumerate(results_r, 1):
+                            bbox_lines.append(f'{i}: "{res[1]}"')
+                    else:
+                        bbox_lines.append("[No text detected]")
+                    bbox_text = "\n".join(bbox_lines)
+
+                    # Save marked/context images if configured
+                    if config.get('logging', {}).get('save_marked', True):
+                        if results_l:
+                            left_marked_path = os.path.join(capture_dir, "left_context.png")
+                            draw_and_save(np.array(prep_l), results_l, left_marked_path, verbose=verbose)
+                        if results_r:
+                            right_marked_path = os.path.join(capture_dir, "right_context.png")
+                            draw_and_save(np.array(prep_r), results_r, right_marked_path, verbose=verbose)
+                else:
+                    # Single page mode (No splitting)
+                    print("[OCR] Running single-page mode (dynamic split disabled)...")
+                    ocr_start_time = time.time()
+                    results, prep, final_text, stats = run_ocr_pipeline(
+                        process_frame,
+                        config,
+                        verbose=verbose,
+                        track_stats=track_stats
+                    )
+                    ocr_duration = time.time() - ocr_start_time
+
+                    # Construct bbox.txt content for single page mode
+                    bbox_lines = []
+                    if results:
+                        for i, res in enumerate(results, 1):
+                            bbox_lines.append(f'{i}: "{res[1]}"')
+                    else:
+                        bbox_lines.append("[No text detected]")
+                    bbox_text = "\n".join(bbox_lines)
+
+                    # Save marked/context image if configured
+                    if config.get('logging', {}).get('save_marked', True) and results:
+                        marked_path = os.path.join(capture_dir, "context.png")
+                        draw_and_save(np.array(prep), results, marked_path, verbose=verbose)
+
+                # Print OCR result to terminal
+                print("\n" + "="*40)
+                print(f"★ OCR RESULT (Task #{capture_index}) ★")
+                print("="*40)
+                if final_text.strip():
+                    print(final_text)
+                else:
+                    print("[No text detected]")
+                print("="*40 + "\n")
+
+                # Save OCR result to txt file
+                txt_save_path = os.path.join(capture_dir, "ocr.txt")
+                with open(txt_save_path, 'w', encoding='utf-8') as f:
+                    f.write(final_text)
+                print(f"💾 OCR text saved to: {txt_save_path}")
+
+                # Save bounding boxes text file
+                bbox_save_path = os.path.join(capture_dir, "bbox.txt")
+                with open(bbox_save_path, 'w', encoding='utf-8') as f:
+                    f.write(bbox_text)
+                print(f"💾 Bounding box text saved to: {bbox_save_path}")
+
+                # Save text payload to stream/page_{page_num:04d}.json and update stream/metadata.json atomically
+                try:
+                    func_dir = os.path.dirname(os.path.abspath(__file__))
+                    proj_root = os.path.dirname(func_dir)
+                    stream_dir = os.path.join(proj_root, "stream")
+                    os.makedirs(stream_dir, exist_ok=True)
+                    
+                    page_json_path = os.path.join(stream_dir, f"page_{capture_index:04d}.json")
+                    payload = {
+                        "capture_id": f"{session_timestamp}_{capture_index:04d}",
+                        "text": final_text,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    with open(page_json_path, 'w', encoding='utf-8') as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=4)
+                    print(f"💾 Saved page payload to: {page_json_path}")
+                    
+                    # Write metadata.json atomically using temp file and replace
+                    meta_path = os.path.join(stream_dir, "metadata.json")
+                    temp_meta_path = os.path.join(stream_dir, "metadata.tmp.json")
+                    meta_payload = {
+                        "latest_page": capture_index,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    with open(temp_meta_path, 'w', encoding='utf-8') as f:
+                        json.dump(meta_payload, f, ensure_ascii=False, indent=4)
+                    os.replace(temp_meta_path, meta_path)
+                    print(f"💾 Atomically updated metadata to: {meta_path}")
+                except Exception as e:
+                    print(f"WARNING: Failed to save monitor JSON payload or metadata: {e}")
+
+                if track_stats:
+                    print(f" - Pure OCR Time: {ocr_duration:.2f}s")
+
+            except Exception as e:
+                print(f"Failed to run OCR layout split pipeline: {e}", file=sys.stderr)
+        else:
+            print("Error: No frames collected for stacking.", file=sys.stderr)

@@ -10,8 +10,10 @@ camera:
 ocr:
   engine: "paddleocr"  # Options: "easyocr", "paddleocr"
   languages: ['ko', 'en']
-  gpu: false
+  gpu: true
   paragraph: true
+  orientation_classify: false  # Set to true to auto-rotate pages (can cause 180-deg flip bug)
+  doc_unwarping: false 
 
 # Image Processing Settings
 image:
@@ -28,7 +30,8 @@ enhancement:
   sharpening: true              # Apply sharpening filter
   strength: "unsharp"            # "standard", "strong" sharpening kernel, or "unsharp" masking
   stacking:
-    max_frames: 15              # Number of frames to stack (e.g. 50 frames for approx 1.6s)
+    enabled: true               # Enable dynamic multi-frame stacking (True/False)
+    max_frames: 30              # Number of frames to stack (e.g. 15 frames)
     scale_factor: 2             # Stacking resolution upscale multiplier (e.g., 2 for 4K, 4 for 8K)
 
 # Path Settings

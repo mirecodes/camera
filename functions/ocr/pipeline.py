@@ -126,18 +126,99 @@ def get_resource_usage() -> Tuple[float, float, float]:
     cpu_times = PROCESS_OBJ.cpu_times()
     return mem_mb, cpu_times.user, cpu_times.system
 
+def classify_boxes(results: list, H: int) -> List[str]:
+    """
+    Classifies boxes as 'header', 'footer', or 'body' based on geometric layout.
+    """
+    labels = ["body"] * len(results)
+    if not results or H <= 0:
+        return labels
+        
+    box_infos = []
+    for i, res in enumerate(results):
+        if len(res) < 2 or res[0] is None or len(res[0]) < 4:
+            box_infos.append(None)
+            continue
+        bbox = res[0]
+        try:
+            ys = [p[1] for p in bbox]
+            y_top, y_bottom = min(ys), max(ys)
+            height = y_bottom - y_top
+            y_center = (y_top + y_bottom) / 2.0
+            text = res[1][0] if isinstance(res[1], tuple) else res[1]
+            box_infos.append({
+                'index': i,
+                'y_top': y_top,
+                'y_bottom': y_bottom,
+                'y_center': y_center,
+                'height': height,
+                'text': text
+            })
+        except Exception:
+            box_infos.append(None)
+            
+    # Candidates
+    header_candidates = []
+    footer_candidates = []
+    body_indices = []
+    
+    for info in box_infos:
+        if info is None:
+            continue
+        if info['y_center'] < 0.12 * H:
+            header_candidates.append(info)
+        elif info['y_center'] > 0.88 * H:
+            footer_candidates.append(info)
+        else:
+            body_indices.append(info['index'])
+            
+    # If there is no body text, we do not classify headers/footers to avoid deleting the only text on the page
+    if not body_indices:
+        return labels
+        
+    body_boxes = [box_infos[idx] for idx in body_indices]
+    min_body_y = min(b['y_top'] for b in body_boxes)
+    max_body_y = max(b['y_bottom'] for b in body_boxes)
+    
+    # Check header candidates
+    for cand in header_candidates:
+        gap = min_body_y - cand['y_bottom']
+        if gap > 1.8 * cand['height']:
+            labels[cand['index']] = "header"
+        else:
+            body_boxes.append(cand)
+            min_body_y = min(b['y_top'] for b in body_boxes)
+            
+    # Check footer candidates
+    for cand in footer_candidates:
+        gap = cand['y_top'] - max_body_y
+        if gap > 1.8 * cand['height']:
+            labels[cand['index']] = "footer"
+            
+    return labels
+
 def draw_and_save(image_np: np.ndarray, results: list, output_path: str, verbose: bool = False):
     """Generates a visual debug image with bounding boxes and detection indices."""
     img_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-    for i, res in enumerate(results, 1):
+    H = image_np.shape[0]
+    labels = classify_boxes(results, H)
+    
+    for i, res in enumerate(results):
         if len(res) < 2 or res[0] is None or len(res[0]) < 1: continue
         bbox, text = res[0], res[1]
+        label = labels[i]
         
+        # Color coding: body = green (0, 255, 0), header/footer = orange (0, 165, 255)
+        color = (0, 255, 0)
+        if label in ("header", "footer"):
+            color = (0, 165, 255) # Orange in BGR
+            
         pts = np.array(bbox, np.int32).reshape((-1, 1, 2))
-        cv2.polylines(img_cv, [pts], True, (0, 255, 0), 2)
+        cv2.polylines(img_cv, [pts], True, color, 2)
         
         try:
-            cv2.putText(img_cv, str(i), (int(bbox[0][0]), int(bbox[0][1]) - 10), 
+            label_text = f"{i+1}({label[0].upper()})"
+            cv2.putText(img_cv, label_text, (int(bbox[0][0]), int(bbox[0][1]) - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         except: pass
             
@@ -145,7 +226,7 @@ def draw_and_save(image_np: np.ndarray, results: list, output_path: str, verbose
     if verbose:
         print(f" -> Result visualization saved to: {output_path}")
 
-def reconstruct_paragraphs(results: list, config: dict, is_left_page: bool = False) -> Tuple[List[str], bool]:
+def reconstruct_paragraphs(results: list, config: dict, is_left_page: bool = False, image_height: Optional[int] = None) -> Tuple[List[str], bool]:
     """
     Groups OCR bounding boxes into lines, sorts them, detects paragraph breaks
     based on layout properties (line width and vertical gaps), and applies spacing correction.
@@ -155,10 +236,18 @@ def reconstruct_paragraphs(results: list, config: dict, is_left_page: bool = Fal
     """
     if not results:
         return [], False
+        
+    labels = ["body"] * len(results)
+    if image_height is not None:
+        labels = classify_boxes(results, image_height)
     
     valid_items = []
-    for res in results:
+    for i, res in enumerate(results):
         if len(res) >= 2 and res[0] is not None and len(res[0]) >= 4:
+            # Filter out headers and footers
+            if labels[i] in ("header", "footer"):
+                continue
+                
             text = res[1]
             if isinstance(text, tuple):
                 text = text[0]
@@ -320,7 +409,7 @@ def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, trac
         image_pil = Image.fromarray(cv2.cvtColor(output_np, cv2.COLOR_BGR2RGB))
     
     # 3. Post-process text using paragraph reconstruction
-    paragraphs, _ = reconstruct_paragraphs(results, config, is_left_page=False)
+    paragraphs, _ = reconstruct_paragraphs(results, config, is_left_page=False, image_height=image_np.shape[0])
     final_text = "\n\n".join(paragraphs)
             
     stats = {}

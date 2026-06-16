@@ -12,7 +12,7 @@ import layoutparser as lp
 ssl._create_default_https_context = ssl._create_unverified_context
 
 class WebcamCapturer:
-    def __init__(self, config_path="cfg/config.yaml"):
+    def __init__(self, config_path="cfg/capture_cfg.yaml"):
         # Resolve paths relative to project root (two levels up from functions/capture.py)
         file_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(file_dir)
@@ -44,6 +44,7 @@ class WebcamCapturer:
         os.makedirs(self.image_output_dir, exist_ok=True)
 
         session_timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.session_timestamp = session_timestamp
         self.session_dir = os.path.join(self.image_output_dir, session_timestamp)
         os.makedirs(self.session_dir, exist_ok=True)
         self.capture_count = 0
@@ -445,6 +446,26 @@ class WebcamCapturer:
                             with open(bbox_save_path, 'w', encoding='utf-8') as f:
                                 f.write(bbox_text)
                             print(f"💾 Bounding box text saved to: {bbox_save_path}")
+
+                            # Save text payload to stream/ocr_result.json for the GUI monitor
+                            try:
+                                import json
+                                func_dir = os.path.dirname(os.path.abspath(__file__))
+                                proj_root = os.path.dirname(func_dir)
+                                stream_dir = os.path.join(proj_root, "stream")
+                                os.makedirs(stream_dir, exist_ok=True)
+                                json_path = os.path.join(stream_dir, "ocr_result.json")
+                                
+                                payload = {
+                                    "capture_id": f"{self.session_timestamp}_{self.capture_count:04d}",
+                                    "text": final_text,
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                                }
+                                with open(json_path, 'w', encoding='utf-8') as f:
+                                    json.dump(payload, f, ensure_ascii=False, indent=4)
+                                print(f"💾 Saved real-time monitor payload to: {json_path}")
+                            except Exception as e:
+                                print(f"WARNING: Failed to save monitor JSON payload: {e}")
 
                             if track_stats:
                                 print(f" - Pure OCR Time: {ocr_duration:.2f}s")

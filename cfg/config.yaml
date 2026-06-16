@@ -1,0 +1,54 @@
+camera:
+  index: 0
+  resolution:
+    width: 1920
+    height: 1080
+  fps: 30
+  record_stream: true  # If true, capture webcam streams to video_output for frame stacking
+
+# OCR Engine Settings
+ocr:
+  engine: "paddleocr"  # Options: "easyocr", "paddleocr"
+  languages: ['ko', 'en']
+  gpu: false
+  paragraph: true
+
+# Image Processing Settings
+image:
+  max_size: 1500
+  preprocess: true
+  crop:
+    enabled: false  # Disabled by default, enable for book margin cropping
+    width_pct: 100.0
+    height_pct: 100.0
+
+# Image Enhancement & Quality Settings
+enhancement:
+  enabled: true                 # Enable image sharpening for live captures
+  sharpening: true              # Apply sharpening filter
+  strength: "unsharp"            # "standard", "strong" sharpening kernel, or "unsharp" masking
+  stacking:
+    max_frames: 15              # Number of frames to stack (e.g. 50 frames for approx 1.6s)
+    scale_factor: 2             # Stacking resolution upscale multiplier (e.g., 2 for 4K, 4 for 8K)
+
+# Path Settings
+paths:
+  video_output: "stream/temp_output.mp4"
+  image_output_dir: "data/"
+  models: "models"
+  outputs: "outputs"
+
+# Logging & Debugging
+logging:
+  verbose: true
+  save_marked: true
+  resource_tracking: true  # Track CPU and Memory usage per image
+
+# Post Processing Settings
+post_process:
+  kiwi_spacing: true  # Correct Korean spacing using kiwipiepy if installed
+  reset_whitespace: true  # Recalculate spacing from scratch (recommended for OCR)
+
+# Document Layout Parsing Settings
+layout:
+  dynamic_split: true  # Toggle dynamic split line detection and double-page OCR (True/False)

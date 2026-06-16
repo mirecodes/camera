@@ -126,6 +126,130 @@ def get_resource_usage() -> Tuple[float, float, float]:
     cpu_times = PROCESS_OBJ.cpu_times()
     return mem_mb, cpu_times.user, cpu_times.system
 
+def find_split_line_from_boxes(results: list, W: int) -> int:
+    """
+    Finds the optimal vertical split line by analyzing horizontal overlap of OCR bounding boxes.
+    """
+    x_histogram = np.zeros(W, dtype=np.int32)
+    for res in results:
+        if len(res) < 2 or res[0] is None or len(res[0]) < 4:
+            continue
+        bbox = res[0]
+        try:
+            xs = [p[0] for p in bbox]
+            x_min = int(max(0, min(xs)))
+            x_max = int(max(0, min(max(xs), W)))
+            x_histogram[x_min:x_max] += 1
+        except Exception:
+            continue
+
+    roi_start = int(W * 0.40)
+    roi_end = int(W * 0.60)
+    roi_histogram = x_histogram[roi_start:roi_end]
+    
+    if len(roi_histogram) == 0:
+        return W // 2
+        
+    min_overlap = np.min(roi_histogram)
+    min_indices = np.where(roi_histogram == min_overlap)[0] + roi_start
+    center = W // 2
+    best_split_x = min_indices[np.argmin(np.abs(min_indices - center))]
+    return int(best_split_x)
+
+def get_page_data(results: list, W: int, H: int, is_left: bool, split_x: int) -> Tuple[list, List[str], Tuple[int, int, int, int]]:
+    """
+    Filters, shifts coordinates, classifies, and computes the body text crop box for a single page.
+    Returns: (shifted_results, labels, (x1, y1, x2, y2) relative to process_frame)
+    """
+    page_results = []
+    for res in results:
+        if len(res) < 2 or res[0] is None or len(res[0]) < 4:
+            continue
+        bbox = res[0]
+        try:
+            xs = [p[0] for p in bbox]
+            x_center = sum(xs) / len(xs)
+            
+            # Filter based on split line
+            if is_left and x_center >= split_x:
+                continue
+            if not is_left and x_center < split_x:
+                continue
+                
+            # Shift x coordinate relative to the cropped page origin
+            x_offset = 0 if is_left else split_x
+            shifted_bbox = [[p[0] - x_offset, p[1]] for p in bbox]
+            
+            page_results.append([shifted_bbox, res[1]])
+        except Exception:
+            continue
+            
+    # Classify boxes on this page
+    labels = classify_boxes(page_results, H)
+    
+    # Compute outer bounding box of the body blocks
+    body_xs = []
+    body_ys = []
+    for i, res in enumerate(page_results):
+        if labels[i] == "body":
+            bbox = res[0]
+            body_xs.extend([p[0] for p in bbox])
+            body_ys.extend([p[1] for p in bbox])
+            
+    # Define the crop region relative to process_frame
+    page_w = split_x if is_left else (W - split_x)
+    x_offset = 0 if is_left else split_x
+    
+    if body_xs and body_ys:
+        margin = 25 # safety padding in pixels
+        x1 = max(0, int(min(body_xs)) - margin)
+        y1 = max(0, int(min(body_ys)) - margin)
+        x2 = min(page_w, int(max(body_xs)) + margin)
+        y2 = min(H, int(max(body_ys)) + margin)
+        
+        # Map back to process_frame coordinates
+        crop_box = (x1 + x_offset, y1, x2 + x_offset, y2)
+    else:
+        # Fallback to full cropped page if no body text
+        crop_box = (x_offset, 0, x_offset + page_w, H)
+        
+    return page_results, labels, crop_box
+
+def draw_and_save_labeled(crop_img_np: np.ndarray, page_results: list, labels: List[str], crop_box: Tuple[int, int, int, int], is_left: bool, split_x: int, output_path: str, verbose: bool = False):
+    """Generates visual debug image with bounding boxes on the cropped page."""
+    img_cv = cv2.cvtColor(crop_img_np, cv2.COLOR_RGB2BGR)
+    x_offset = 0 if is_left else split_x
+    
+    # crop_box is (x1_glob, y1_glob, x2_glob, y2_glob) relative to process_frame
+    crop_x1 = crop_box[0] - x_offset
+    crop_y1 = crop_box[1]
+    
+    for i, res in enumerate(page_results):
+        if len(res) < 2 or res[0] is None or len(res[0]) < 1: continue
+        bbox, text = res[0], res[1]
+        label = labels[i]
+        
+        # Shift bbox relative to crop origin
+        shifted_bbox = [[p[0] - crop_x1, p[1] - crop_y1] for p in bbox]
+        
+        # Color coding: body = green (0, 255, 0), header/footer = orange (0, 165, 255)
+        color = (0, 255, 0)
+        if label in ("header", "footer"):
+            color = (0, 165, 255) # Orange in BGR
+            
+        pts = np.array(shifted_bbox, np.int32).reshape((-1, 1, 2))
+        cv2.polylines(img_cv, [pts], True, color, 2)
+        
+        try:
+            label_text = f"{i+1}({label[0].upper()})"
+            cv2.putText(img_cv, label_text, (int(shifted_bbox[0][0]), int(shifted_bbox[0][1]) - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        except: pass
+            
+    cv2.imwrite(output_path, img_cv)
+    if verbose:
+        print(f" -> Result visualization saved to: {output_path}")
+
 def classify_boxes(results: list, H: int) -> List[str]:
     """
     Classifies boxes as 'header', 'footer', or 'body' based on geometric layout.

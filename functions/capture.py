@@ -378,7 +378,7 @@ class WebcamCapturer:
             # Run Layout-aware splitting and OCR
             print("Running Document AI layout analysis & split on captured frame...")
             try:
-                from functions.ocr.pipeline import run_ocr_pipeline, draw_and_save
+                from functions.ocr.pipeline import run_ocr_pipeline, draw_and_save, find_split_line_from_boxes, get_page_data, draw_and_save_labeled
 
                 verbose = config.get('logging', {}).get('verbose', True)
                 track_stats = config.get('logging', {}).get('resource_tracking', True)
@@ -388,14 +388,30 @@ class WebcamCapturer:
 
                 if use_dynamic_split:
                     h_proc, w_proc = process_frame.shape[:2]
-                    split_x = w_proc // 2
                     
-                    # Fix: Keep full height (0 to h_proc) to prevent cutting text at the top and bottom
-                    y1, y2 = 0, h_proc
-
-                    # Slice into Left and Right cropped regions without central margins or vertical margins
-                    left_cropped = process_frame[y1:y2, 0:split_x]
-                    right_cropped = process_frame[y1:y2, split_x:w_proc]
+                    # 1. Run OCR on the full un-split page
+                    print("[OCR] Running full-page OCR spread analysis...")
+                    ocr_start_time = time.time()
+                    results, prep_img, _, stats = run_ocr_pipeline(
+                        process_frame,
+                        config,
+                        verbose=verbose,
+                        track_stats=track_stats
+                    )
+                    
+                    # 2. Find optimal split line based on OCR boxes
+                    split_x = find_split_line_from_boxes(results, w_proc)
+                    print(f"[Layout Splitting] Calculated split line at x={split_x} based on OCR text blocks.")
+                    
+                    # 3. Separate, classify and calculate body bounding boxes for left/right
+                    results_l, labels_l, crop_box_l = get_page_data(results, w_proc, h_proc, is_left=True, split_x=split_x)
+                    results_r, labels_r, crop_box_r = get_page_data(results, w_proc, h_proc, is_left=False, split_x=split_x)
+                    
+                    # 4. Crop to body bounding boxes
+                    left_cropped = process_frame[crop_box_l[1]:crop_box_l[3], crop_box_l[0]:crop_box_l[2]]
+                    right_cropped = process_frame[crop_box_r[1]:crop_box_r[3], crop_box_r[0]:crop_box_r[2]]
+                    
+                    ocr_duration = time.time() - ocr_start_time
 
                     # Save page crops
                     left_crop_path = os.path.join(capture_dir, "left.png")
@@ -405,27 +421,9 @@ class WebcamCapturer:
                     cv2.imwrite(right_crop_path, right_cropped)
                     print(f"💾 Saved right page crop to: {right_crop_path}")
 
-                    # Run OCR sequentially
-                    ocr_start_time = time.time()
-                    print("[OCR] Running PaddleOCR on Left Page...")
-                    results_l, prep_l, text_l, stats_l = run_ocr_pipeline(
-                        left_cropped,
-                        config,
-                        verbose=verbose,
-                        track_stats=track_stats
-                    )
-                    print("[OCR] Running PaddleOCR on Right Page...")
-                    results_r, prep_r, text_r, stats_r = run_ocr_pipeline(
-                        right_cropped,
-                        config,
-                        verbose=verbose,
-                        track_stats=track_stats
-                    )
-                    ocr_duration = time.time() - ocr_start_time
-
                     from functions.ocr.pipeline import reconstruct_paragraphs
-                    paragraphs_l, last_is_open = reconstruct_paragraphs(results_l, config, is_left_page=True, image_height=left_cropped.shape[0])
-                    paragraphs_r, _ = reconstruct_paragraphs(results_r, config, is_left_page=False, image_height=right_cropped.shape[0])
+                    paragraphs_l, last_is_open = reconstruct_paragraphs(results_l, config, is_left_page=True, image_height=h_proc)
+                    paragraphs_r, _ = reconstruct_paragraphs(results_r, config, is_left_page=False, image_height=h_proc)
                     
                     if last_is_open and paragraphs_l and paragraphs_r:
                         merged_para = paragraphs_l[-1] + " " + paragraphs_r[0]
@@ -440,26 +438,26 @@ class WebcamCapturer:
                     bbox_lines.append("--- Left Page ---")
                     if results_l:
                         for i, res in enumerate(results_l, 1):
-                            bbox_lines.append(f'{i}: "{res[1]}"')
+                            t_val = res[1][0] if isinstance(res[1], tuple) else res[1]
+                            bbox_lines.append(f'{i}: "{t_val}"')
                     else:
                         bbox_lines.append("[No text detected]")
                     bbox_lines.append("")
                     bbox_lines.append("--- Right Page ---")
                     if results_r:
                         for i, res in enumerate(results_r, 1):
-                            bbox_lines.append(f'{i}: "{res[1]}"')
+                            t_val = res[1][0] if isinstance(res[1], tuple) else res[1]
+                            bbox_lines.append(f'{i}: "{t_val}"')
                     else:
                         bbox_lines.append("[No text detected]")
                     bbox_text = "\n".join(bbox_lines)
 
                     # Save marked/context images if configured
                     if config.get('logging', {}).get('save_marked', True):
-                        if results_l:
-                            left_marked_path = os.path.join(capture_dir, "left_context.png")
-                            draw_and_save(np.array(prep_l), results_l, left_marked_path, verbose=verbose)
-                        if results_r:
-                            right_marked_path = os.path.join(capture_dir, "right_context.png")
-                            draw_and_save(np.array(prep_r), results_r, right_marked_path, verbose=verbose)
+                        left_marked_path = os.path.join(capture_dir, "left_context.png")
+                        draw_and_save_labeled(left_cropped, results_l, labels_l, crop_box_l, True, split_x, left_marked_path, verbose=verbose)
+                        right_marked_path = os.path.join(capture_dir, "right_context.png")
+                        draw_and_save_labeled(right_cropped, results_r, labels_r, crop_box_r, False, split_x, right_marked_path, verbose=verbose)
                 else:
                     # Single page mode (No splitting)
                     print("[OCR] Running single-page mode (dynamic split disabled)...")
@@ -476,7 +474,8 @@ class WebcamCapturer:
                     bbox_lines = []
                     if results:
                         for i, res in enumerate(results, 1):
-                            bbox_lines.append(f'{i}: "{res[1]}"')
+                            t_val = res[1][0] if isinstance(res[1], tuple) else res[1]
+                            bbox_lines.append(f'{i}: "{t_val}"')
                     else:
                         bbox_lines.append("[No text detected]")
                     bbox_text = "\n".join(bbox_lines)

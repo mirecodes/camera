@@ -8,7 +8,7 @@ camera:
 
 # OCR Engine Settings
 ocr:
-  engine: "paddleocr"  # Options: "easyocr", "paddleocr"
+  engine: "easyocr"  # Options: "easyocr", "paddleocr"
   languages: ['ko', 'en']
   gpu: true
   paragraph: true

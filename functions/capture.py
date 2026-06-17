@@ -278,6 +278,12 @@ class WebcamCapturer:
                 # Show stream
                 cv2.imshow('Webcam Live Stream', display_frame)
 
+                # Check if the window was closed (returns < 1 or -1 on close)
+                if cv2.getWindowProperty('Webcam Live Stream', cv2.WND_PROP_VISIBLE) < 1:
+                    print("Window closed by user.")
+                    self.task_queue.put(None)
+                    break
+
                 # Save to full stream video if recording is enabled
                 if out is not None:
                     out.write(frame)
@@ -305,6 +311,15 @@ class WebcamCapturer:
                         print("Error: Frame buffer is empty, cannot capture.", file=sys.stderr)
                     
         finally:
+            # Signal worker thread to stop
+            if hasattr(self, 'task_queue'):
+                self.task_queue.put(None)
+            
+            # Wait for worker thread to finish
+            if hasattr(self, 'worker_thread') and self.worker_thread.is_alive():
+                print("Waiting for background worker thread to finish...")
+                self.worker_thread.join(timeout=2.0)
+            
             cap.release()
             if out is not None:
                 out.release()

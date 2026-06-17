@@ -15,12 +15,19 @@ MODEL_ROOT = os.path.join(PROJECT_ROOT, "models")
 PADDLE_MODEL_PATH = os.path.abspath(os.path.join(MODEL_ROOT, "paddle"))
 
 def setup_ocr_env():
-    """Sets environment variables for redirecting engine model paths."""
+    """Sets environment variables for redirecting engine model paths and limiting threads."""
     os.makedirs(PADDLE_MODEL_PATH, exist_ok=True)
     os.environ['PADDLE_HOME'] = PADDLE_MODEL_PATH
     os.environ['PADDLEX_HOME'] = PADDLE_MODEL_PATH
     os.environ['PADDLE_PDX_HOME'] = PADDLE_MODEL_PATH
     os.environ['HOME'] = PADDLE_MODEL_PATH
+    
+    # Restrict thread pools to 1 thread to prevent macOS from stuttering due to excessive thread spawning/leaks
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
+    os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+    os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
 # Set environments immediately upon import
 setup_ocr_env()

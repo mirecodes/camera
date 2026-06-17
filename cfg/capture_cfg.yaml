@@ -9,8 +9,7 @@ camera:
 
 # OCR Engine Settings
 ocr:
-  layout_engine: "easyocr"   # Engine for layout analysis, splitting & cropping (EasyOCR is recommended)
-  text_engine: "paddleocr"   # Engine for final text extraction on cropped pages (Options: "easyocr", "paddleocr")
+  engine: "paddleocr"  # Default OCR Engine (PaddleOCR)
   languages: ['ko', 'en']
   gpu: true
   paragraph: true
@@ -33,7 +32,7 @@ enhancement:
   strength: "unsharp"            # "standard", "strong" sharpening kernel, or "unsharp" masking
   stacking:
     enabled: true               # Enable dynamic multi-frame stacking (True/False)
-    max_frames: 30              # Number of frames to stack (e.g. 15 frames)
+    max_frames: 15              # Number of frames to stack (e.g. 15 frames)
     scale_factor: 2             # Stacking resolution upscale multiplier (e.g., 2 for 4K, 4 for 8K)
 
 # Path Settings
@@ -60,4 +59,4 @@ layout:
 
 # Development & Offline Testing Settings
 development:
-  reprocess_latest: false  # If true, re-run OCR & crop pipeline on the latest captured raw.png instead of camera stream
+  reprocess_latest: true  # If true, re-run OCR & crop pipeline on the latest captured raw.png instead of camera stream

@@ -33,6 +33,7 @@ class PaddleOCREngine(OCREngine):
             use_doc_orientation_classify=use_orientation,
             use_doc_unwarping=use_doc_unwarping,
             device=device_str,
+            cpu_threads=1,  # Set to 1 to avoid potential OpenMP multi-threading deadlocks on macOS CPU
         )
         self.last_preprocessed_image = None
 

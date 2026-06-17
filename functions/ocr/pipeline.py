@@ -10,34 +10,29 @@ from PIL import Image, ImageOps, ImageFilter
 
 # Setup local model paths
 FILE_DIR = os.path.dirname(os.path.abspath(__file__))
-# functions/ocr/pipeline.py is 2 levels deep from project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(FILE_DIR))
 MODEL_ROOT = os.path.join(PROJECT_ROOT, "models")
 PADDLE_MODEL_PATH = os.path.abspath(os.path.join(MODEL_ROOT, "paddle"))
-EASY_MODEL_PATH = os.path.abspath(os.path.join(MODEL_ROOT, "easyocr"))
 
 def setup_ocr_env():
     """Sets environment variables for redirecting engine model paths."""
     os.makedirs(PADDLE_MODEL_PATH, exist_ok=True)
-    os.makedirs(EASY_MODEL_PATH, exist_ok=True)
-    
     os.environ['PADDLE_HOME'] = PADDLE_MODEL_PATH
     os.environ['PADDLEX_HOME'] = PADDLE_MODEL_PATH
     os.environ['PADDLE_PDX_HOME'] = PADDLE_MODEL_PATH
-    # Override HOME just in case, but avoid execve unless needed, to prevent import issues
     os.environ['HOME'] = PADDLE_MODEL_PATH
 
 # Set environments immediately upon import
 setup_ocr_env()
 
-# Global SSL bypass for downloading models on restrictive networks
+# Global SSL bypass
 try:
     ssl._create_default_https_context = ssl._create_unverified_context
 except AttributeError:
     pass
 
 # Global instances
-ENGINES = {}
+ENGINE = None
 KIWI = None
 PROCESS_OBJ = psutil.Process(os.getpid())
 
@@ -53,32 +48,28 @@ def get_kiwi() -> Any:
             KIWI = False
     return KIWI
 
-def get_engine_by_name(engine_type: str, config: dict, verbose: bool = False) -> Any:
-    """Initializes and returns the specified OCR engine."""
-    global ENGINES
-    engine_type = engine_type.lower()
-    if engine_type not in ENGINES:
-        if verbose:
-            print(f"Initializing OCR Engine: {engine_type.upper()}...")
-        if engine_type == 'paddleocr':
-            from .paddle_ocr_engine import PaddleOCREngine
-            ENGINES[engine_type] = PaddleOCREngine(config, PADDLE_MODEL_PATH, verbose=verbose)
-        else:
-            from .easy_ocr_engine import EasyOCREngine
-            ENGINES[engine_type] = EasyOCREngine(config, EASY_MODEL_PATH, verbose=verbose)
-    return ENGINES[engine_type]
-
 def get_engine(config: dict, verbose: bool = False) -> Any:
-    """Initializes and returns the OCR engine specified in the configuration."""
-    engine_type = config.get('ocr', {}).get('engine', 'easyocr').lower()
-    return get_engine_by_name(engine_type, config, verbose)
+    """Initializes and returns the singleton PaddleOCR engine."""
+    global ENGINE
+    if ENGINE is None:
+        if verbose:
+            print("Initializing OCR Engine: PADDLEOCR...")
+        from .paddle_ocr_engine import PaddleOCREngine
+        ENGINE = PaddleOCREngine(config, PADDLE_MODEL_PATH, verbose=verbose)
+    return ENGINE
 
-def preprocess_image(img: Image.Image, verbose: bool = False) -> Image.Image:
+def preprocess_image(img: Image.Image, config: dict, verbose: bool = False) -> Image.Image:
     """Enhances text clarity using RGB-based autocontrast and sharpening filters."""
     if verbose:
-        print(" -> Preprocessing: RGB Autocontrast + Sharpening")
+        print(" -> Preprocessing: RGB Autocontrast")
     img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.SHARPEN)
+    
+    # Check if main pipeline sharpening is already active; if so, skip PIL's basic sharpening
+    enhance_cfg = config.get('enhancement', {})
+    if not (enhance_cfg.get('enabled', True) and enhance_cfg.get('sharpening', True)):
+        if verbose:
+            print(" -> Preprocessing: Applying Fallback Sharpening")
+        img = img.filter(ImageFilter.SHARPEN)
     return img
 
 def prepare_image(image_input: Any, config: dict, verbose: bool = False) -> Tuple[np.ndarray, Image.Image]:
@@ -116,7 +107,7 @@ def prepare_image(image_input: Any, config: dict, verbose: bool = False) -> Tupl
             print(f" -> Cropped to {img.width}x{img.height} ({crop_w}%x{crop_h}%)")
     
     if img_cfg.get('preprocess', True):
-        img = preprocess_image(img, verbose=verbose)
+        img = preprocess_image(img, config, verbose=verbose)
         
     if max(img.size) > max_size:
         scale = max_size / max(img.size)
@@ -130,133 +121,10 @@ def get_resource_usage() -> Tuple[float, float, float]:
     cpu_times = PROCESS_OBJ.cpu_times()
     return mem_mb, cpu_times.user, cpu_times.system
 
-def find_split_line_from_boxes(results: list, W: int) -> int:
-    """
-    Finds the optimal vertical split line by analyzing horizontal overlap of OCR bounding boxes.
-    """
-    x_histogram = np.zeros(W, dtype=np.int32)
-    for res in results:
-        if len(res) < 2 or res[0] is None or len(res[0]) < 4:
-            continue
-        bbox = res[0]
-        try:
-            xs = [p[0] for p in bbox]
-            x_min = int(max(0, min(xs)))
-            x_max = int(max(0, min(max(xs), W)))
-            x_histogram[x_min:x_max] += 1
-        except Exception:
-            continue
-
-    roi_start = int(W * 0.40)
-    roi_end = int(W * 0.60)
-    roi_histogram = x_histogram[roi_start:roi_end]
-    
-    if len(roi_histogram) == 0:
-        return W // 2
-        
-    min_overlap = np.min(roi_histogram)
-    min_indices = np.where(roi_histogram == min_overlap)[0] + roi_start
-    center = W // 2
-    best_split_x = min_indices[np.argmin(np.abs(min_indices - center))]
-    return int(best_split_x)
-
-def get_page_data(results: list, W: int, H: int, is_left: bool, split_x: int) -> Tuple[list, List[str], Tuple[int, int, int, int]]:
-    """
-    Filters, shifts coordinates, classifies, and computes the body text crop box for a single page.
-    Returns: (shifted_results, labels, (x1, y1, x2, y2) relative to process_frame)
-    """
-    page_results = []
-    for res in results:
-        if len(res) < 2 or res[0] is None or len(res[0]) < 4:
-            continue
-        bbox = res[0]
-        try:
-            xs = [p[0] for p in bbox]
-            x_center = sum(xs) / len(xs)
-            
-            # Filter based on split line
-            if is_left and x_center >= split_x:
-                continue
-            if not is_left and x_center < split_x:
-                continue
-                
-            # Shift x coordinate relative to the cropped page origin
-            x_offset = 0 if is_left else split_x
-            shifted_bbox = [[p[0] - x_offset, p[1]] for p in bbox]
-            
-            page_results.append([shifted_bbox, res[1]])
-        except Exception:
-            continue
-            
-    # Classify boxes on this page
-    labels = classify_boxes(page_results, H)
-    
-    # Compute outer bounding box of the body blocks
-    body_xs = []
-    body_ys = []
-    for i, res in enumerate(page_results):
-        if labels[i] == "body":
-            bbox = res[0]
-            body_xs.extend([p[0] for p in bbox])
-            body_ys.extend([p[1] for p in bbox])
-            
-    # Define the crop region relative to process_frame
-    page_w = split_x if is_left else (W - split_x)
-    x_offset = 0 if is_left else split_x
-    
-    if body_xs and body_ys:
-        margin = 25 # safety padding in pixels
-        x1 = max(0, int(min(body_xs)) - margin)
-        y1 = max(0, int(min(body_ys)) - margin)
-        x2 = min(page_w, int(max(body_xs)) + margin)
-        y2 = min(H, int(max(body_ys)) + margin)
-        
-        # Map back to process_frame coordinates
-        crop_box = (x1 + x_offset, y1, x2 + x_offset, y2)
-    else:
-        # Fallback to full cropped page if no body text
-        crop_box = (x_offset, 0, x_offset + page_w, H)
-        
-    return page_results, labels, crop_box
-
-def draw_and_save_labeled(crop_img_np: np.ndarray, page_results: list, labels: List[str], crop_box: Tuple[int, int, int, int], is_left: bool, split_x: int, output_path: str, verbose: bool = False):
-    """Generates visual debug image with bounding boxes on the cropped page."""
-    img_cv = cv2.cvtColor(crop_img_np, cv2.COLOR_RGB2BGR)
-    x_offset = 0 if is_left else split_x
-    
-    # crop_box is (x1_glob, y1_glob, x2_glob, y2_glob) relative to process_frame
-    crop_x1 = crop_box[0] - x_offset
-    crop_y1 = crop_box[1]
-    
-    for i, res in enumerate(page_results):
-        if len(res) < 2 or res[0] is None or len(res[0]) < 1: continue
-        bbox, text = res[0], res[1]
-        label = labels[i]
-        
-        # Shift bbox relative to crop origin
-        shifted_bbox = [[p[0] - crop_x1, p[1] - crop_y1] for p in bbox]
-        
-        # Color coding: body = green (0, 255, 0), header/footer = orange (0, 165, 255)
-        color = (0, 255, 0)
-        if label in ("header", "footer"):
-            color = (0, 165, 255) # Orange in BGR
-            
-        pts = np.array(shifted_bbox, np.int32).reshape((-1, 1, 2))
-        cv2.polylines(img_cv, [pts], True, color, 2)
-        
-        try:
-            label_text = f"{i+1}({label[0].upper()})"
-            cv2.putText(img_cv, label_text, (int(shifted_bbox[0][0]), int(shifted_bbox[0][1]) - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        except: pass
-            
-    cv2.imwrite(output_path, img_cv)
-    if verbose:
-        print(f" -> Result visualization saved to: {output_path}")
-
 def classify_boxes(results: list, H: int) -> List[str]:
     """
     Classifies boxes as 'header', 'footer', or 'body' based on geometric layout.
+    Filters isolated boxes in the upper/lower 15% margins.
     """
     labels = ["body"] * len(results)
     if not results or H <= 0:
@@ -285,44 +153,37 @@ def classify_boxes(results: list, H: int) -> List[str]:
         except Exception:
             box_infos.append(None)
             
-    # Candidates
-    header_candidates = []
-    footer_candidates = []
-    body_indices = []
-    
-    for info in box_infos:
+    # For each box, compute isolation and classify
+    for i, info in enumerate(box_infos):
         if info is None:
             continue
-        if info['y_center'] < 0.12 * H:
-            header_candidates.append(info)
-        elif info['y_center'] > 0.88 * H:
-            footer_candidates.append(info)
-        else:
-            body_indices.append(info['index'])
             
-    # If there is no body text, we do not classify headers/footers to avoid deleting the only text on the page
-    if not body_indices:
-        return labels
+        y_center = info['y_center']
+        in_margin = (y_center < 0.15 * H) or (y_center > 0.85 * H)
         
-    body_boxes = [box_infos[idx] for idx in body_indices]
-    min_body_y = min(b['y_top'] for b in body_boxes)
-    max_body_y = max(b['y_bottom'] for b in body_boxes)
-    
-    # Check header candidates
-    for cand in header_candidates:
-        gap = min_body_y - cand['y_bottom']
-        if gap > 1.8 * cand['height']:
-            labels[cand['index']] = "header"
-        else:
-            body_boxes.append(cand)
-            min_body_y = min(b['y_top'] for b in body_boxes)
-            
-    # Check footer candidates
-    for cand in footer_candidates:
-        gap = cand['y_top'] - max_body_y
-        if gap > 1.8 * cand['height']:
-            labels[cand['index']] = "footer"
-            
+        if in_margin:
+            # Check vertical distance to the nearest other box
+            min_dist = float('inf')
+            for j, other in enumerate(box_infos):
+                if i == j or other is None:
+                    continue
+                # Calculate vertical distance
+                if info['y_bottom'] <= other['y_top']:
+                    dist = other['y_top'] - info['y_bottom']
+                elif other['y_bottom'] <= info['y_top']:
+                    dist = info['y_top'] - other['y_bottom']
+                else:
+                    dist = 0.0 # vertical overlap
+                if dist < min_dist:
+                    min_dist = dist
+                    
+            # If isolated (min_dist > 1.8 * height of box), classify as header/footer
+            if min_dist > 1.8 * info['height']:
+                if y_center < 0.15 * H:
+                    labels[i] = "header"
+                else:
+                    labels[i] = "footer"
+                    
     return labels
 
 def draw_and_save(image_np: np.ndarray, results: list, output_path: str, verbose: bool = False):
@@ -460,7 +321,6 @@ def reconstruct_paragraphs(results: list, config: dict, is_left_page: bool = Fal
         is_para_end = False
         if i == len(merged_lines) - 1:
             if is_left_page:
-                # For the last line of the left page, check if it meets the criteria of paragraph end
                 is_para_end = False
                 if line['width'] < 0.82 * max_width:
                     text_stripped = line['text'].strip()
@@ -485,7 +345,6 @@ def reconstruct_paragraphs(results: list, config: dict, is_left_page: bool = Fal
                     is_para_end = True
                     
         if is_para_end or (i == len(merged_lines) - 1):
-            # Combine items of current paragraph
             para_text = " ".join(current_para)
             
             # Spacing correction on this paragraph
@@ -500,19 +359,9 @@ def reconstruct_paragraphs(results: list, config: dict, is_left_page: bool = Fal
             
     return paragraphs, last_is_open
 
-def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, track_stats: bool = False, engine_type: Optional[str] = None) -> Tuple[list, Image.Image, str, dict]:
+def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, track_stats: bool = False) -> Tuple[list, Image.Image, str, dict]:
     """
-    Executes the complete OCR pipeline.
-    
-    Args:
-        image_input: File path, PIL Image, or Numpy Array.
-        config: Configuration dictionary.
-        verbose: Print logging info.
-        track_stats: Measure CPU/Memory usage.
-        engine_type: Optional OCR engine name override.
-        
-    Returns:
-        (results, preprocessed_pil, final_text, stats_dict)
+    Executes the complete OCR pipeline using the PaddleOCR engine.
     """
     start_time = time.time()
     mem_start, u_start, s_start = get_resource_usage() if track_stats else (0, 0, 0)
@@ -520,10 +369,8 @@ def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, trac
     # 1. Image preparation
     image_np, image_pil = prepare_image(image_input, config, verbose=verbose)
     
-    # 2. Get OCR Engine & read text
-    if engine_type is None:
-        engine_type = config.get('ocr', {}).get('engine', 'easyocr')
-    engine = get_engine_by_name(engine_type, config, verbose=verbose)
+    # 2. Get PaddleOCR Engine
+    engine = get_engine(config, verbose=verbose)
     
     ocr_start_time = time.time()
     results = engine.read_text(image_np)
@@ -531,11 +378,10 @@ def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, trac
     
     mem_end, u_end, s_end = get_resource_usage() if track_stats else (0, 0, 0)
     
-    # Check if the OCR engine produced a preprocessed/rotated image (e.g. PaddleOCR's internal preprocessor)
+    # Check if the OCR engine produced a preprocessed/rotated image
     if hasattr(engine, 'last_preprocessed_image') and engine.last_preprocessed_image is not None:
         if verbose:
             print(" -> OCR Engine returned an internally preprocessed/rotated image. Using it for PIL return.")
-        # PaddleOCR's returned image is BGR, so convert to RGB for PIL Image compatibility
         output_np = engine.last_preprocessed_image
         image_pil = Image.fromarray(cv2.cvtColor(output_np, cv2.COLOR_BGR2RGB))
     

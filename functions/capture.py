@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import queue
+import threading
 import json
 import multiprocessing
 from collections import deque
@@ -31,6 +32,7 @@ class WebcamCapturer:
         # Check if development.reprocess_latest is enabled
         dev_cfg = self.config.get('development', {})
         self.reprocess_mode = dev_cfg.get('reprocess_latest', False)
+        self.custom_split_x = None
 
         # Parse flip option
         self.flip = self.config.get('camera', {}).get('flip', 0)
@@ -68,34 +70,46 @@ class WebcamCapturer:
         stacking_cfg = enhance_cfg.get('stacking', {})
         self.max_frames = max(2, int(stacking_cfg.get('max_frames', 50)))
 
-        # Async Multiprocessing Queue & Worker State
-        self.task_queue = multiprocessing.Queue()
-        self.status_queue = multiprocessing.Queue()
+        if self.reprocess_mode:
+            print("[Offline Mode] Initializing in offline reprocessing mode. Camera and background worker initialization skipped.")
+            return
+
+        # Async Threading Queue & Worker State
+        self.task_queue = queue.Queue()
+        self.status_queue = queue.Queue()
         self.q_size = 0
         self.processing_status = "Idle"
         
-        # Start background worker process
-        self.worker_process = multiprocessing.Process(
+        # Start background worker thread
+        self.worker_thread = threading.Thread(
             target=self.processing_worker_proc, 
             args=(self.task_queue, self.status_queue, self.config, self.session_dir, self.session_timestamp), 
             daemon=True
         )
-        self.worker_process.start()
+        self.worker_thread.start()
 
     def load_config(self):
+        """Loads and parses the YAML configuration file from the defined config path."""
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"Configuration file not found at: {self.config_path}")
         with open(self.config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
 
     def is_blurry(self, image, threshold=10.0):
-        """Helper to check blurriness of captured frame."""
+        """
+        Determines if an image is blurry by calculating the variance of its Laplacian.
+        Returns:
+            (laplacian_var, is_blurry_bool)
+        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         return laplacian_var, laplacian_var < threshold
 
     def apply_flip(self, frame):
-        """Rotates or flips the frame based on the configuration."""
+        """
+        Applies rotation or flip options to the frame based on camera configuration.
+        Supported flips: 90, 180, 270, 'horizontal', 'vertical'.
+        """
         if frame is None:
             return frame
         if self.flip == 180 or self.flip == "180":
@@ -110,118 +124,62 @@ class WebcamCapturer:
             return cv2.flip(frame, 0)
         return frame
 
-    @staticmethod
-    def find_dynamic_split_line(layout_result, img_width):
-        """
-        Dynamically finds the optimal vertical line to split a double-page document spread
-        based on the horizontal distribution (histogram) of detected text blocks.
-        """
-        # 1. Create a 1D text accumulation histogram across the width
-        x_histogram = np.zeros(img_width, dtype=np.int32)
-        accepted_types = {'text', 'paragraph', 'body'}
-        body_blocks = [b for b in layout_result if b.type.lower() in accepted_types]
-
-        if not body_blocks:
-            default_split = img_width // 2
-            print(f"[Dynamic Split] No text blocks found. Fallback split point: {default_split}")
-            return default_split
-
-        # Accumulate coordinate intervals into histogram
-        for b in body_blocks:
-            x_min = int(max(0, min(b.coordinates[0], img_width)))
-            x_max = int(max(0, min(b.coordinates[2], img_width)))
-            x_histogram[x_min:x_max] += 1
-
-        # 2. Limit the valley search to the central 40% - 60% ROI of the image
-        roi_start = int(img_width * 0.40)
-        roi_end = int(img_width * 0.60)
-        roi_histogram = x_histogram[roi_start:roi_end]
-
-        # 3. Find the lowest overlap index closest to the center
-        min_overlap = np.min(roi_histogram)
-        min_indices = np.where(roi_histogram == min_overlap)[0] + roi_start
-        center = img_width // 2
-        
-        # Select the candidate index that minimizes distance to the physical center
-        best_split_x = min_indices[np.argmin(np.abs(min_indices - center))]
-
-        # 4. Fallback condition: If the valley is not clear (min_overlap > 1)
-        if min_overlap <= 1:
-            split_x = int(best_split_x)
-            print(f"[Dynamic Split] Detected split line at x={split_x} (overlap={min_overlap}).")
-        else:
-            split_x = img_width // 2
-            print(f"[Dynamic Split] WARNING: No clear valley (min_overlap={min_overlap}). Fallback to center x={split_x}.")
-
-        # 5. Output ASCII text density histogram in console logs
-        print("\n[Dynamic Split Log] X-Histogram ASCII density (40% - 60% range):")
-        step = max(1, (roi_end - roi_start) // 20)
-        for i in range(roi_start, roi_end, step):
-            val = x_histogram[i]
-            bar = "#" * val
-            print(f"  x={i:4d} | {bar:<10} ({val})")
-        print()
-
-        return split_x
-
     def reprocess_latest_data(self):
         """
-        Finds the latest raw.png in the data directory and runs the processing pipeline on it.
+        Locates the latest session directory under data/, clears all intermediate products
+        (everything except raw.png) in all capture subfolders (0000, 0001, etc.), and reprocesses them.
         """
         import glob
-        # Find all session directories (e.g. data/20260616_193636)
         session_dirs = sorted([d for d in glob.glob(os.path.join(self.image_output_dir, "*")) if os.path.isdir(d)])
         if not session_dirs:
             print("Error: No session directories found in image output directory.", file=sys.stderr)
             return
 
-        # Start checking from the latest session directory backwards
-        latest_raw_path = None
-        target_session_dir = None
-        target_capture_idx = None
-        
-        for sess_dir in reversed(session_dirs):
-            capture_dirs = sorted([d for d in glob.glob(os.path.join(sess_dir, "*")) if os.path.isdir(d)])
-            for cap_dir in reversed(capture_dirs):
-                raw_path = os.path.join(cap_dir, "raw.png")
-                if os.path.exists(raw_path):
-                    latest_raw_path = raw_path
-                    target_session_dir = sess_dir
-                    try:
-                        target_capture_idx = int(os.path.basename(cap_dir))
-                    except ValueError:
-                        target_capture_idx = 0
-                    break
-            if latest_raw_path:
-                break
-                
-        if not latest_raw_path:
-            print("Error: No raw.png found in any capture directory.", file=sys.stderr)
-            return
-            
-        print(f"[Reprocess Latest] Found latest raw image: {latest_raw_path}")
-        print(f" -> Session directory: {target_session_dir}")
-        print(f" -> Capture Index: {target_capture_idx}")
-        
-        img = cv2.imread(latest_raw_path)
-        if img is None:
-            print(f"Error: Could not read image at {latest_raw_path}", file=sys.stderr)
-            return
-            
-        # Apply flip/rotation configuration
-        img = self.apply_flip(img)
-            
+        target_session_dir = session_dirs[-1]
         session_timestamp = os.path.basename(target_session_dir)
-        
-        print(f"[Reprocess Latest] Running pipeline on {latest_raw_path}...")
-        self.execute_capture_task(
-            capture_index=target_capture_idx,
-            captured_frames=[img],
-            config=self.config,
-            session_dir=target_session_dir,
-            session_timestamp=session_timestamp
-        )
-        print("[Reprocess Latest] Finished reprocessing.")
+        print(f"[Reprocess Session] Processing all capture folders in latest session: {target_session_dir}")
+
+        capture_dirs = sorted([d for d in glob.glob(os.path.join(target_session_dir, "*")) if os.path.isdir(d)])
+        if not capture_dirs:
+            print(f"Error: No capture directories found in session {target_session_dir}", file=sys.stderr)
+            return
+
+        for cap_dir in capture_dirs:
+            try:
+                cap_idx = int(os.path.basename(cap_dir))
+            except ValueError:
+                continue
+
+            raw_path = os.path.join(cap_dir, "raw.png")
+            if not os.path.exists(raw_path):
+                print(f"[Reprocess Session] Skipping {cap_dir} - raw.png not found.")
+                continue
+
+            print(f"\n[Reprocess Session] Clearing intermediate files in capture {cap_idx:04d}...")
+            # Delete intermediate files except raw.png, left.png, and right.png
+            for f in os.listdir(cap_dir):
+                f_path = os.path.join(cap_dir, f)
+                if os.path.isfile(f_path) and f not in ("raw.png", "left.png", "right.png"):
+                    try:
+                        os.remove(f_path)
+                    except Exception as e:
+                        print(f"  -> Failed to delete {f}: {e}")
+
+            img = cv2.imread(raw_path)
+            if img is None:
+                print(f"Error: Could not read image at {raw_path}", file=sys.stderr)
+                continue
+
+            # raw.png is already saved with the flip/rotation applied, so do not apply it again here.
+            print(f"[Reprocess Session] Running pipeline on {raw_path}...")
+            self.execute_capture_task(
+                capture_index=cap_idx,
+                captured_frames=[img],
+                config=self.config,
+                session_dir=target_session_dir,
+                session_timestamp=session_timestamp
+            )
+        print("[Reprocess Latest] Finished batch reprocessing.")
 
     def run(self, record_stream=False):
         """
@@ -259,8 +217,17 @@ class WebcamCapturer:
         print("\n=== Control Commands ===")
         print(" - Press 'c' on the video window to CAPTURE the current frame.")
         print(" - Press 'q' on the video window to QUIT.")
+        print(" - CLICK on the video window to select a CUSTOM vertical split line.")
         print("========================\n")
         
+        cv2.namedWindow('Webcam Live Stream')
+        self.custom_split_x = None
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.custom_split_x = x
+                print(f"[Split Line Selection] User selected split line at x={x}")
+        cv2.setMouseCallback('Webcam Live Stream', mouse_callback)
+
         # Initialize rolling frame buffer
         frame_buffer = deque(maxlen=self.max_frames)
         
@@ -302,6 +269,12 @@ class WebcamCapturer:
                 cv2.putText(display_frame, status_msg, (10, 65),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
 
+                # Draw split line
+                if self.custom_split_x is not None:
+                    cv2.line(display_frame, (self.custom_split_x, 0), (self.custom_split_x, actual_height), (0, 0, 255), 2)
+                else:
+                    cv2.line(display_frame, (actual_width // 2, 0), (actual_width // 2, actual_height), (0, 255, 255), 1)
+
                 # Show stream
                 cv2.imshow('Webcam Live Stream', display_frame)
 
@@ -321,7 +294,8 @@ class WebcamCapturer:
                     if len(captured_frames) > 0:
                         task_info = {
                             'capture_index': self.capture_count,
-                            'frames': captured_frames
+                            'frames': captured_frames,
+                            'custom_split_x': self.custom_split_x
                         }
                         self.task_queue.put(task_info)
                         self.q_size += 1
@@ -339,7 +313,18 @@ class WebcamCapturer:
 
     @staticmethod
     def processing_worker_proc(task_queue, status_queue, config, session_dir, session_timestamp):
-        """Worker process function: runs entirely in a separate OS process to bypass the GIL."""
+        """Worker thread function: runs background tasks and pre-warms the OCR engine."""
+        # Pre-warm PaddleOCR in the background thread to compile JIT/graphs before first capture
+        try:
+            print("\n[OCR Pre-warm] Pre-warming PaddleOCR engine in background thread...")
+            from functions.ocr.pipeline import get_engine
+            engine = get_engine(config, verbose=True)
+            dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
+            engine.read_text(dummy_img)
+            print("[OCR Pre-warm] Background pre-warming completed. Ready for captures!\n")
+        except Exception as e:
+            print(f"[OCR Pre-warm] Failed to pre-warm engine in background: {e}", file=sys.stderr)
+
         while True:
             try:
                 task = task_queue.get()
@@ -348,16 +333,25 @@ class WebcamCapturer:
                 
                 capture_index = task['capture_index']
                 captured_frames = task['frames']
+                custom_split_x = task.get('custom_split_x', None)
                 
                 status_queue.put(("started", capture_index))
-                WebcamCapturer.execute_capture_task(capture_index, captured_frames, config, session_dir, session_timestamp)
+                WebcamCapturer.execute_capture_task(capture_index, captured_frames, config, session_dir, session_timestamp, custom_split_x)
                 status_queue.put(("done", capture_index))
             except Exception as e:
                 print(f"[Worker Process Error] Failed to process capture: {e}", file=sys.stderr)
 
     @staticmethod
-    def execute_capture_task(capture_index, captured_frames, config, session_dir, session_timestamp):
+    def execute_capture_task(capture_index, captured_frames, config, session_dir, session_timestamp, custom_split_x=None):
         """Executes the heavy stacking, alignment, layout detection, and OCR in the background."""
+        task_start_t = time.time()
+        stack_t = 0.0
+        enhance_t = 0.0
+        split_t = 0.0
+        ocr_left_t = 0.0
+        ocr_right_t = 0.0
+        ocr_post_t = 0.0
+
         capture_dir = os.path.join(session_dir, f"{capture_index:04d}")
         os.makedirs(capture_dir, exist_ok=True)
         
@@ -371,6 +365,7 @@ class WebcamCapturer:
             scale = max(1, int(stacking_cfg.get('scale_factor', 2)))
             
             if stacking_enabled and len(captured_frames) > 1:
+                t0 = time.time()
                 # Merge frames in grayscale
                 all_stack_frames = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in captured_frames]
                 print(f"\n[Stacking - Async #{capture_index}] Aligning and Stacking {len(all_stack_frames)} frames using ECC...")
@@ -427,7 +422,9 @@ class WebcamCapturer:
                 print(f" -> Successfully aligned {aligned_count}/{len(all_stack_frames)} frames.")
                 stacked_scaled = stacked_float_scaled / aligned_count
                 stacked_scaled = np.clip(stacked_scaled, 0, 255).astype(np.uint8)
+                stack_t = time.time() - t0
             else:
+                t0 = time.time()
                 # Stacking disabled: use the last captured frame
                 print(f"\n[Stacking - Async #{capture_index}] Stacking disabled. Using single frame.")
                 single_frame = captured_frames[-1]
@@ -438,8 +435,10 @@ class WebcamCapturer:
                 h, w = gray_frame.shape
                 h_scaled, w_scaled = h * scale, w * scale
                 stacked_scaled = cv2.resize(gray_frame, (w_scaled, h_scaled), interpolation=cv2.INTER_LANCZOS4)
+                stack_t = time.time() - t0
 
             # Apply sharpening if enabled in configuration
+            t0 = time.time()
             if enhance_cfg.get('enabled', True) and enhance_cfg.get('sharpening', True):
                 strength = enhance_cfg.get('strength', 'strong')
                 if strength == "unsharp":
@@ -470,11 +469,12 @@ class WebcamCapturer:
             # Save enhanced frame
             cv2.imwrite(enhanced_save_path, process_frame, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
             print(f"💾 Saved stacked & sharpened frame to: {enhanced_save_path}")
+            enhance_t = time.time() - t0
 
             # Run Layout-aware splitting and OCR
             print("Running Document AI layout analysis & split on captured frame...")
             try:
-                from functions.ocr.pipeline import run_ocr_pipeline, draw_and_save, find_split_line_from_boxes, get_page_data, draw_and_save_labeled
+                from functions.ocr.pipeline import run_ocr_pipeline, draw_and_save
 
                 verbose = config.get('logging', {}).get('verbose', True)
                 track_stats = config.get('logging', {}).get('resource_tracking', True)
@@ -483,63 +483,74 @@ class WebcamCapturer:
                 use_dynamic_split = config.get('layout', {}).get('dynamic_split', True)
 
                 if use_dynamic_split:
-                    h_proc, w_proc = process_frame.shape[:2]
-                    
-                    # 1. Run OCR on the full un-split page using the layout engine (EasyOCR)
-                    layout_engine = config.get('ocr', {}).get('layout_engine', 'easyocr')
-                    print(f"[OCR] Running full-page OCR spread analysis using {layout_engine}...")
-                    ocr_start_time = time.time()
-                    results, prep_img, _, stats = run_ocr_pipeline(
-                        process_frame,
-                        config,
-                        verbose=verbose,
-                        track_stats=track_stats,
-                        engine_type=layout_engine
-                    )
-                    
-                    # 2. Find optimal split line based on OCR boxes
-                    split_x = find_split_line_from_boxes(results, w_proc)
-                    print(f"[Layout Splitting] Calculated split line at x={split_x} based on OCR text blocks.")
-                    
-                    # 3. Separate, classify and calculate body bounding boxes for left/right
-                    results_l, labels_l, crop_box_l = get_page_data(results, w_proc, h_proc, is_left=True, split_x=split_x)
-                    results_r, labels_r, crop_box_r = get_page_data(results, w_proc, h_proc, is_left=False, split_x=split_x)
-                    
-                    # 4. Crop to body bounding boxes
-                    left_cropped = process_frame[crop_box_l[1]:crop_box_l[3], crop_box_l[0]:crop_box_l[2]]
-                    right_cropped = process_frame[crop_box_r[1]:crop_box_r[3], crop_box_r[0]:crop_box_r[2]]
-                    
-                    # Save page crops
+                    t0 = time.time()
                     left_crop_path = os.path.join(capture_dir, "left.png")
                     right_crop_path = os.path.join(capture_dir, "right.png")
-                    cv2.imwrite(left_crop_path, left_cropped)
-                    print(f"💾 Saved left page crop to: {left_crop_path}")
-                    cv2.imwrite(right_crop_path, right_cropped)
-                    print(f"💾 Saved right page crop to: {right_crop_path}")
+                    
+                    if os.path.exists(left_crop_path) and os.path.exists(right_crop_path):
+                        print("[Reprocess] Loading existing raw split pages...")
+                        left_cropped_raw = cv2.imread(left_crop_path, cv2.IMREAD_GRAYSCALE)
+                        right_cropped_raw = cv2.imread(right_crop_path, cv2.IMREAD_GRAYSCALE)
+                        
+                        # Apply max_size config limit if images are too large to prevent CPU hangs
+                        img_cfg = config.get('image', {})
+                        if img_cfg.get('preprocess', True):
+                            max_size = img_cfg.get('max_size', 1500)
+                            for crop_img in (left_cropped_raw, right_cropped_raw):
+                                if crop_img is not None and max(crop_img.shape[:2]) > max_size:
+                                    h_c, w_c = crop_img.shape[:2]
+                                    scale_c = max_size / max(h_c, w_c)
+                                    if crop_img is left_cropped_raw:
+                                        left_cropped_raw = cv2.resize(left_cropped_raw, (int(w_c * scale_c), int(h_c * scale_c)), interpolation=cv2.INTER_AREA)
+                                    else:
+                                        right_cropped_raw = cv2.resize(right_cropped_raw, (int(w_c * scale_c), int(h_c * scale_c)), interpolation=cv2.INTER_AREA)
+                    else:
+                        h_proc, w_proc = stacked_scaled.shape[:2]
+                        if custom_split_x is not None:
+                            split_x = int(custom_split_x * scale)
+                        else:
+                            split_x = w_proc // 2
+                        
+                        left_cropped_raw = stacked_scaled[:, 0:split_x]
+                        right_cropped_raw = stacked_scaled[:, split_x:w_proc]
+                        
+                        # Save raw split images
+                        cv2.imwrite(left_crop_path, left_cropped_raw)
+                        print(f"💾 Saved raw left page crop to: {left_crop_path}")
+                        cv2.imwrite(right_crop_path, right_cropped_raw)
+                        print(f"💾 Saved raw right page crop to: {right_crop_path}")
+                    
+                    # Use raw split crops directly for OCR to avoid over-processing / double enhancement
+                    left_cropped = left_cropped_raw
+                    right_cropped = right_cropped_raw
+                        
+                    split_t = time.time() - t0
 
-                    # 5. Run text extraction OCR on the cropped body page using text_engine
-                    text_engine = config.get('ocr', {}).get('text_engine', 'paddleocr')
-                    print(f"[OCR] Running text-extraction OCR on Left Page using {text_engine}...")
+                    # Run text extraction OCR on the cropped body page
+                    print("[OCR] Running PaddleOCR on Left Page...")
+                    t0 = time.time()
                     results_l_text, prep_l, text_l, stats_l = run_ocr_pipeline(
                         left_cropped,
                         config,
                         verbose=verbose,
-                        track_stats=track_stats,
-                        engine_type=text_engine
+                        track_stats=track_stats
                     )
-                    print(f"[OCR] Running text-extraction OCR on Right Page using {text_engine}...")
+                    ocr_left_t = time.time() - t0
+
+                    print("[OCR] Running PaddleOCR on Right Page...")
+                    t0 = time.time()
                     results_r_text, prep_r, text_r, stats_r = run_ocr_pipeline(
                         right_cropped,
                         config,
                         verbose=verbose,
-                        track_stats=track_stats,
-                        engine_type=text_engine
+                        track_stats=track_stats
                     )
-                    ocr_duration = time.time() - ocr_start_time
+                    ocr_right_t = time.time() - t0
 
+                    t0 = time.time()
                     from functions.ocr.pipeline import reconstruct_paragraphs
-                    paragraphs_l, last_is_open = reconstruct_paragraphs(results_l_text, config, is_left_page=True)
-                    paragraphs_r, _ = reconstruct_paragraphs(results_r_text, config, is_left_page=False)
+                    paragraphs_l, last_is_open = reconstruct_paragraphs(results_l_text, config, is_left_page=True, image_height=left_cropped.shape[0])
+                    paragraphs_r, _ = reconstruct_paragraphs(results_r_text, config, is_left_page=False, image_height=right_cropped.shape[0])
                     
                     if last_is_open and paragraphs_l and paragraphs_r:
                         merged_para = paragraphs_l[-1] + " " + paragraphs_r[0]
@@ -568,30 +579,28 @@ class WebcamCapturer:
                         bbox_lines.append("[No text detected]")
                     bbox_text = "\n".join(bbox_lines)
 
-                    # Save marked/context images of full-height pages showing layout classification
+                    # Save marked/context images of cropped pages showing layout classification
                     if config.get('logging', {}).get('save_marked', True):
                         left_marked_path = os.path.join(capture_dir, "left_context.png")
-                        left_uncropped = process_frame[:, 0:split_x]
-                        full_box_l = (0, 0, split_x, h_proc)
-                        draw_and_save_labeled(left_uncropped, results_l, labels_l, full_box_l, True, split_x, left_marked_path, verbose=verbose)
+                        draw_and_save(np.array(prep_l), results_l_text, left_marked_path, verbose=verbose)
                         
                         right_marked_path = os.path.join(capture_dir, "right_context.png")
-                        right_uncropped = process_frame[:, split_x:w_proc]
-                        full_box_r = (split_x, 0, w_proc, h_proc)
-                        draw_and_save_labeled(right_uncropped, results_r, labels_r, full_box_r, False, split_x, right_marked_path, verbose=verbose)
+                        draw_and_save(np.array(prep_r), results_r_text, right_marked_path, verbose=verbose)
+                    ocr_post_t = time.time() - t0
                 else:
                     # Single page mode (No splitting)
                     print("[OCR] Running single-page mode (dynamic split disabled)...")
-                    ocr_start_time = time.time()
+                    t0 = time.time()
                     results, prep, final_text, stats = run_ocr_pipeline(
                         process_frame,
                         config,
                         verbose=verbose,
                         track_stats=track_stats
                     )
-                    ocr_duration = time.time() - ocr_start_time
+                    ocr_left_t = time.time() - t0
 
                     # Construct bbox.txt content for single page mode
+                    t0 = time.time()
                     bbox_lines = []
                     if results:
                         for i, res in enumerate(results, 1):
@@ -605,6 +614,7 @@ class WebcamCapturer:
                     if config.get('logging', {}).get('save_marked', True) and results:
                         marked_path = os.path.join(capture_dir, "context.png")
                         draw_and_save(np.array(prep), results, marked_path, verbose=verbose)
+                    ocr_post_t = time.time() - t0
 
                 # Print OCR result to terminal
                 print("\n" + "="*40)
@@ -659,8 +669,23 @@ class WebcamCapturer:
                 except Exception as e:
                     print(f"WARNING: Failed to save monitor JSON payload or metadata: {e}")
 
-                if track_stats:
-                    print(f" - Pure OCR Time: {ocr_duration:.2f}s")
+                # Print Performance Profile Table
+                total_duration = time.time() - task_start_t
+                print("\n" + "="*50)
+                print(f"⏱️  PERFORMANCE PROFILE (Task #{capture_index}) ⏱️")
+                print("="*50)
+                print(f" - Image Stacking/Alignment: {stack_t:.3f}s")
+                print(f" - Image Enhancement (Sharpen): {enhance_t:.3f}s")
+                if use_dynamic_split:
+                    print(f" - Layout Crop & Splitting: {split_t:.3f}s")
+                    print(f" - OCR Left Page: {ocr_left_t:.3f}s")
+                    print(f" - OCR Right Page: {ocr_right_t:.3f}s")
+                    print(f" - OCR Post-processing: {ocr_post_t:.3f}s")
+                else:
+                    print(f" - OCR Single Page: {ocr_left_t:.3f}s")
+                    print(f" - OCR Post-processing: {ocr_post_t:.3f}s")
+                print(f" - Total Execution Time: {total_duration:.3f}s")
+                print("="*50 + "\n")
 
             except Exception as e:
                 print(f"Failed to run OCR layout split pipeline: {e}", file=sys.stderr)

@@ -5,10 +5,12 @@ camera:
     height: 1080
   fps: 30
   record_stream: true  # If true, capture webcam streams to video_output for frame stacking
+  flip: 180            # Rotate/flip options: 0 (none), 90 (clockwise), 180, 270 (counter-clockwise), "horizontal", "vertical"
 
 # OCR Engine Settings
 ocr:
-  engine: "easyocr"  # Options: "easyocr", "paddleocr"
+  layout_engine: "easyocr"   # Engine for layout analysis, splitting & cropping (EasyOCR is recommended)
+  text_engine: "paddleocr"   # Engine for final text extraction on cropped pages (Options: "easyocr", "paddleocr")
   languages: ['ko', 'en']
   gpu: true
   paragraph: true
@@ -55,3 +57,7 @@ post_process:
 # Document Layout Parsing Settings
 layout:
   dynamic_split: true  # Toggle dynamic split line detection and double-page OCR (True/False)
+
+# Development & Offline Testing Settings
+development:
+  reprocess_latest: false  # If true, re-run OCR & crop pipeline on the latest captured raw.png instead of camera stream

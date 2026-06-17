@@ -37,7 +37,7 @@ except AttributeError:
     pass
 
 # Global instances
-ENGINE = None
+ENGINES = {}
 KIWI = None
 PROCESS_OBJ = psutil.Process(os.getpid())
 
@@ -53,21 +53,25 @@ def get_kiwi() -> Any:
             KIWI = False
     return KIWI
 
-def get_engine(config: dict, verbose: bool = False) -> Any:
-    """Initializes and returns the OCR engine specified in the configuration."""
-    global ENGINE
-    if ENGINE is None:
-        engine_type = config.get('ocr', {}).get('engine', 'easyocr').lower()
+def get_engine_by_name(engine_type: str, config: dict, verbose: bool = False) -> Any:
+    """Initializes and returns the specified OCR engine."""
+    global ENGINES
+    engine_type = engine_type.lower()
+    if engine_type not in ENGINES:
         if verbose:
             print(f"Initializing OCR Engine: {engine_type.upper()}...")
-            
         if engine_type == 'paddleocr':
             from .paddle_ocr_engine import PaddleOCREngine
-            ENGINE = PaddleOCREngine(config, PADDLE_MODEL_PATH, verbose=verbose)
+            ENGINES[engine_type] = PaddleOCREngine(config, PADDLE_MODEL_PATH, verbose=verbose)
         else:
             from .easy_ocr_engine import EasyOCREngine
-            ENGINE = EasyOCREngine(config, EASY_MODEL_PATH, verbose=verbose)
-    return ENGINE
+            ENGINES[engine_type] = EasyOCREngine(config, EASY_MODEL_PATH, verbose=verbose)
+    return ENGINES[engine_type]
+
+def get_engine(config: dict, verbose: bool = False) -> Any:
+    """Initializes and returns the OCR engine specified in the configuration."""
+    engine_type = config.get('ocr', {}).get('engine', 'easyocr').lower()
+    return get_engine_by_name(engine_type, config, verbose)
 
 def preprocess_image(img: Image.Image, verbose: bool = False) -> Image.Image:
     """Enhances text clarity using RGB-based autocontrast and sharpening filters."""
@@ -496,7 +500,7 @@ def reconstruct_paragraphs(results: list, config: dict, is_left_page: bool = Fal
             
     return paragraphs, last_is_open
 
-def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, track_stats: bool = False) -> Tuple[list, Image.Image, str, dict]:
+def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, track_stats: bool = False, engine_type: Optional[str] = None) -> Tuple[list, Image.Image, str, dict]:
     """
     Executes the complete OCR pipeline.
     
@@ -505,6 +509,7 @@ def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, trac
         config: Configuration dictionary.
         verbose: Print logging info.
         track_stats: Measure CPU/Memory usage.
+        engine_type: Optional OCR engine name override.
         
     Returns:
         (results, preprocessed_pil, final_text, stats_dict)
@@ -516,7 +521,9 @@ def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, trac
     image_np, image_pil = prepare_image(image_input, config, verbose=verbose)
     
     # 2. Get OCR Engine & read text
-    engine = get_engine(config, verbose=verbose)
+    if engine_type is None:
+        engine_type = config.get('ocr', {}).get('engine', 'easyocr')
+    engine = get_engine_by_name(engine_type, config, verbose=verbose)
     
     ocr_start_time = time.time()
     results = engine.read_text(image_np)

@@ -28,19 +28,30 @@ class WebcamCapturer:
         print(f"Loading configuration from: {self.config_path}")
         self.config = self.load_config()
 
+        # Check if development.reprocess_latest is enabled
+        dev_cfg = self.config.get('development', {})
+        self.reprocess_mode = dev_cfg.get('reprocess_latest', False)
+
+        # Parse flip option
+        self.flip = self.config.get('camera', {}).get('flip', 0)
+
+        image_out_rel = self.config.get('paths', {}).get('image_output_dir', 'data/')
+        self.image_output_dir = os.path.join(project_root, image_out_rel) if not os.path.isabs(image_out_rel) else image_out_rel
+
+        if self.reprocess_mode:
+            print("[Offline Mode] Initializing in offline reprocessing mode. Camera and background worker initialization skipped.")
+            return
+
         # Parse config parameters
-        self.camera_index = self.config['camera']['index']
-        self.width = self.config['camera']['resolution']['width']
-        self.height = self.config['camera']['resolution']['height']
-        self.fps = self.config['camera'].get('fps', 30)
-        self.record_stream = self.config['camera'].get('record_stream', True)
+        self.camera_index = self.config.get('camera', {}).get('index', 0)
+        self.width = self.config.get('camera', {}).get('resolution', {}).get('width', 1920)
+        self.height = self.config.get('camera', {}).get('resolution', {}).get('height', 1080)
+        self.fps = self.config.get('camera', {}).get('fps', 30)
+        self.record_stream = self.config.get('camera', {}).get('record_stream', True)
 
         # Resolve output directories
-        video_out_rel = self.config['paths']['video_output']
+        video_out_rel = self.config.get('paths', {}).get('video_output', 'stream/temp_output.mp4')
         self.video_output_path = os.path.join(project_root, video_out_rel) if not os.path.isabs(video_out_rel) else video_out_rel
-
-        image_out_rel = self.config['paths']['image_output_dir']
-        self.image_output_dir = os.path.join(project_root, image_out_rel) if not os.path.isabs(image_out_rel) else image_out_rel
 
         # Ensure directories exist
         os.makedirs(os.path.dirname(self.video_output_path), exist_ok=True)
@@ -82,6 +93,22 @@ class WebcamCapturer:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         return laplacian_var, laplacian_var < threshold
+
+    def apply_flip(self, frame):
+        """Rotates or flips the frame based on the configuration."""
+        if frame is None:
+            return frame
+        if self.flip == 180 or self.flip == "180":
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        elif self.flip == 90 or self.flip == "90":
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif self.flip == 270 or self.flip == "270":
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif self.flip == "horizontal":
+            return cv2.flip(frame, 1)
+        elif self.flip == "vertical":
+            return cv2.flip(frame, 0)
+        return frame
 
     @staticmethod
     def find_dynamic_split_line(layout_result, img_width):
@@ -137,11 +164,77 @@ class WebcamCapturer:
 
         return split_x
 
+    def reprocess_latest_data(self):
+        """
+        Finds the latest raw.png in the data directory and runs the processing pipeline on it.
+        """
+        import glob
+        # Find all session directories (e.g. data/20260616_193636)
+        session_dirs = sorted([d for d in glob.glob(os.path.join(self.image_output_dir, "*")) if os.path.isdir(d)])
+        if not session_dirs:
+            print("Error: No session directories found in image output directory.", file=sys.stderr)
+            return
+
+        # Start checking from the latest session directory backwards
+        latest_raw_path = None
+        target_session_dir = None
+        target_capture_idx = None
+        
+        for sess_dir in reversed(session_dirs):
+            capture_dirs = sorted([d for d in glob.glob(os.path.join(sess_dir, "*")) if os.path.isdir(d)])
+            for cap_dir in reversed(capture_dirs):
+                raw_path = os.path.join(cap_dir, "raw.png")
+                if os.path.exists(raw_path):
+                    latest_raw_path = raw_path
+                    target_session_dir = sess_dir
+                    try:
+                        target_capture_idx = int(os.path.basename(cap_dir))
+                    except ValueError:
+                        target_capture_idx = 0
+                    break
+            if latest_raw_path:
+                break
+                
+        if not latest_raw_path:
+            print("Error: No raw.png found in any capture directory.", file=sys.stderr)
+            return
+            
+        print(f"[Reprocess Latest] Found latest raw image: {latest_raw_path}")
+        print(f" -> Session directory: {target_session_dir}")
+        print(f" -> Capture Index: {target_capture_idx}")
+        
+        img = cv2.imread(latest_raw_path)
+        if img is None:
+            print(f"Error: Could not read image at {latest_raw_path}", file=sys.stderr)
+            return
+            
+        # Apply flip/rotation configuration
+        img = self.apply_flip(img)
+            
+        session_timestamp = os.path.basename(target_session_dir)
+        
+        print(f"[Reprocess Latest] Running pipeline on {latest_raw_path}...")
+        self.execute_capture_task(
+            capture_index=target_capture_idx,
+            captured_frames=[img],
+            config=self.config,
+            session_dir=target_session_dir,
+            session_timestamp=session_timestamp
+        )
+        print("[Reprocess Latest] Finished reprocessing.")
+
     def run(self, record_stream=False):
         """
         Runs the webcam live stream with instant non-blocking capture and overlay metrics.
         :param record_stream: If True, saves the entire stream to video_output_path.
         """
+        # Check if development.reprocess_latest is enabled
+        dev_cfg = self.config.get('development', {})
+        if dev_cfg.get('reprocess_latest', False):
+            print("\n[Reprocess Latest] Running in offline development mode.")
+            self.reprocess_latest_data()
+            return
+
         print(f"Opening camera index {self.camera_index}...")
         cap = cv2.VideoCapture(self.camera_index)
 
@@ -177,6 +270,9 @@ class WebcamCapturer:
                 if not ret:
                     print("Error: Failed to grab frame.", file=sys.stderr)
                     break
+
+                # Apply camera flip/rotation configuration
+                frame = self.apply_flip(frame)
 
                 # Maintain history of frames for stacking
                 frame_buffer.append(frame.copy())
@@ -389,14 +485,16 @@ class WebcamCapturer:
                 if use_dynamic_split:
                     h_proc, w_proc = process_frame.shape[:2]
                     
-                    # 1. Run OCR on the full un-split page
-                    print("[OCR] Running full-page OCR spread analysis...")
+                    # 1. Run OCR on the full un-split page using the layout engine (EasyOCR)
+                    layout_engine = config.get('ocr', {}).get('layout_engine', 'easyocr')
+                    print(f"[OCR] Running full-page OCR spread analysis using {layout_engine}...")
                     ocr_start_time = time.time()
                     results, prep_img, _, stats = run_ocr_pipeline(
                         process_frame,
                         config,
                         verbose=verbose,
-                        track_stats=track_stats
+                        track_stats=track_stats,
+                        engine_type=layout_engine
                     )
                     
                     # 2. Find optimal split line based on OCR boxes
@@ -411,8 +509,6 @@ class WebcamCapturer:
                     left_cropped = process_frame[crop_box_l[1]:crop_box_l[3], crop_box_l[0]:crop_box_l[2]]
                     right_cropped = process_frame[crop_box_r[1]:crop_box_r[3], crop_box_r[0]:crop_box_r[2]]
                     
-                    ocr_duration = time.time() - ocr_start_time
-
                     # Save page crops
                     left_crop_path = os.path.join(capture_dir, "left.png")
                     right_crop_path = os.path.join(capture_dir, "right.png")
@@ -421,9 +517,29 @@ class WebcamCapturer:
                     cv2.imwrite(right_crop_path, right_cropped)
                     print(f"💾 Saved right page crop to: {right_crop_path}")
 
+                    # 5. Run text extraction OCR on the cropped body page using text_engine
+                    text_engine = config.get('ocr', {}).get('text_engine', 'paddleocr')
+                    print(f"[OCR] Running text-extraction OCR on Left Page using {text_engine}...")
+                    results_l_text, prep_l, text_l, stats_l = run_ocr_pipeline(
+                        left_cropped,
+                        config,
+                        verbose=verbose,
+                        track_stats=track_stats,
+                        engine_type=text_engine
+                    )
+                    print(f"[OCR] Running text-extraction OCR on Right Page using {text_engine}...")
+                    results_r_text, prep_r, text_r, stats_r = run_ocr_pipeline(
+                        right_cropped,
+                        config,
+                        verbose=verbose,
+                        track_stats=track_stats,
+                        engine_type=text_engine
+                    )
+                    ocr_duration = time.time() - ocr_start_time
+
                     from functions.ocr.pipeline import reconstruct_paragraphs
-                    paragraphs_l, last_is_open = reconstruct_paragraphs(results_l, config, is_left_page=True, image_height=h_proc)
-                    paragraphs_r, _ = reconstruct_paragraphs(results_r, config, is_left_page=False, image_height=h_proc)
+                    paragraphs_l, last_is_open = reconstruct_paragraphs(results_l_text, config, is_left_page=True)
+                    paragraphs_r, _ = reconstruct_paragraphs(results_r_text, config, is_left_page=False)
                     
                     if last_is_open and paragraphs_l and paragraphs_r:
                         merged_para = paragraphs_l[-1] + " " + paragraphs_r[0]
@@ -436,28 +552,33 @@ class WebcamCapturer:
                     # Construct bbox.txt content for split page mode
                     bbox_lines = []
                     bbox_lines.append("--- Left Page ---")
-                    if results_l:
-                        for i, res in enumerate(results_l, 1):
+                    if results_l_text:
+                        for i, res in enumerate(results_l_text, 1):
                             t_val = res[1][0] if isinstance(res[1], tuple) else res[1]
                             bbox_lines.append(f'{i}: "{t_val}"')
                     else:
                         bbox_lines.append("[No text detected]")
                     bbox_lines.append("")
                     bbox_lines.append("--- Right Page ---")
-                    if results_r:
-                        for i, res in enumerate(results_r, 1):
+                    if results_r_text:
+                        for i, res in enumerate(results_r_text, 1):
                             t_val = res[1][0] if isinstance(res[1], tuple) else res[1]
                             bbox_lines.append(f'{i}: "{t_val}"')
                     else:
                         bbox_lines.append("[No text detected]")
                     bbox_text = "\n".join(bbox_lines)
 
-                    # Save marked/context images if configured
+                    # Save marked/context images of full-height pages showing layout classification
                     if config.get('logging', {}).get('save_marked', True):
                         left_marked_path = os.path.join(capture_dir, "left_context.png")
-                        draw_and_save_labeled(left_cropped, results_l, labels_l, crop_box_l, True, split_x, left_marked_path, verbose=verbose)
+                        left_uncropped = process_frame[:, 0:split_x]
+                        full_box_l = (0, 0, split_x, h_proc)
+                        draw_and_save_labeled(left_uncropped, results_l, labels_l, full_box_l, True, split_x, left_marked_path, verbose=verbose)
+                        
                         right_marked_path = os.path.join(capture_dir, "right_context.png")
-                        draw_and_save_labeled(right_cropped, results_r, labels_r, crop_box_r, False, split_x, right_marked_path, verbose=verbose)
+                        right_uncropped = process_frame[:, split_x:w_proc]
+                        full_box_r = (split_x, 0, w_proc, h_proc)
+                        draw_and_save_labeled(right_uncropped, results_r, labels_r, full_box_r, False, split_x, right_marked_path, verbose=verbose)
                 else:
                     # Single page mode (No splitting)
                     print("[OCR] Running single-page mode (dynamic split disabled)...")

@@ -15,6 +15,9 @@ ocr:
   paragraph: true
   orientation_classify: false  # Set to true to auto-rotate pages (can cause 180-deg flip bug)
   doc_unwarping: false 
+  min_confidence: 0.6          # Confidence score threshold for filtering out bleed-through/noise (0.0 to 1.0)
+  filter_margin_single_char: true # Filter out single characters located in margins
+  margin_ratio: 0.15           # Margins definition ratio (0.15 = outer 15% edge area)
 
 # Image Processing Settings
 image:
@@ -30,6 +33,11 @@ enhancement:
   enabled: true                 # Enable image sharpening for live captures
   sharpening: true              # Apply sharpening filter
   strength: "unsharp"            # "standard", "strong" sharpening kernel, or "unsharp" masking
+  bleed_through_removal: true   # Enable background subtraction + adaptive thresholding for bleed-through removal
+  bleed_through:
+    kernel_size: 21             # Kernel size for background estimation (dilation)
+    block_size: 15              # Block size for adaptive thresholding
+    c_value: 10                 # Constant C value for adaptive thresholding
   stacking:
     enabled: true               # Enable dynamic multi-frame stacking (True/False)
     max_frames: 15              # Number of frames to stack (e.g. 15 frames)

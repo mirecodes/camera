@@ -383,6 +383,45 @@ def run_ocr_pipeline(image_input: Any, config: dict, verbose: bool = False, trac
     results = engine.read_text(image_np)
     ocr_end_time = time.time()
     
+    # Filter OCR results based on confidence and boundary/single-character checks
+    ocr_cfg = config.get('ocr', {})
+    min_confidence = ocr_cfg.get('min_confidence', 0.6)
+    filter_margin = ocr_cfg.get('filter_margin_single_char', True)
+    margin_ratio = ocr_cfg.get('margin_ratio', 0.15)
+    
+    filtered_results = []
+    h_img, w_img = image_np.shape[:2]
+    
+    for res in results:
+        # res matches (poly, text, score) structure
+        poly, text, score = res[0], res[1], res[2]
+        
+        # 1. Confidence score thresholding
+        if score < min_confidence:
+            if verbose:
+                print(f" -> [Filter] Excluded text '{text}' due to low confidence ({score:.3f} < {min_confidence})")
+            continue
+            
+        # 2. Text length and boundary area validation
+        if filter_margin and len(text.strip()) == 1:
+            if poly is not None and len(poly) >= 4:
+                xs = [p[0] for p in poly]
+                ys = [p[1] for p in poly]
+                center_x = sum(xs) / len(poly)
+                center_y = sum(ys) / len(poly)
+                
+                # Check if center is in margin
+                in_x_margin = (center_x < margin_ratio * w_img) or (center_x > (1.0 - margin_ratio) * w_img)
+                in_y_margin = (center_y < margin_ratio * h_img) or (center_y > (1.0 - margin_ratio) * h_img)
+                
+                if in_x_margin or in_y_margin:
+                    if verbose:
+                        print(f" -> [Filter] Excluded single char '{text}' located at margins (x={center_x:.1f}, y={center_y:.1f})")
+                    continue
+                    
+        filtered_results.append(res)
+    results = filtered_results
+    
     mem_end, u_end, s_end = get_resource_usage() if track_stats else (0, 0, 0)
     
     # Check if the OCR engine produced a preprocessed/rotated image

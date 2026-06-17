@@ -51,7 +51,7 @@ Thumbs.db
 models/
 outputs/
 data/
-stream/
+# stream/
 temp_output.mp4
 
 # Pytest / Coverage

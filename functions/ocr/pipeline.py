@@ -131,7 +131,7 @@ def get_resource_usage() -> Tuple[float, float, float]:
 def classify_boxes(results: list, H: int) -> List[str]:
     """
     Classifies boxes as 'header', 'footer', or 'body' based on geometric layout.
-    Filters isolated boxes in the upper/lower 15% margins.
+    Filters isolated boxes in the upper/lower margins.
     """
     labels = ["body"] * len(results)
     if not results or H <= 0:
@@ -166,9 +166,12 @@ def classify_boxes(results: list, H: int) -> List[str]:
             continue
             
         y_center = info['y_center']
-        in_margin = (y_center < 0.15 * H) or (y_center > 0.85 * H)
         
-        if in_margin:
+        # Use asymmetric margins: top margin is 8% (headers), bottom margin is 16% (footers)
+        in_top_margin = (y_center < 0.08 * H)
+        in_bottom_margin = (y_center > 0.84 * H)
+        
+        if in_top_margin or in_bottom_margin:
             # Check vertical distance to the nearest other box
             min_dist = float('inf')
             for j, other in enumerate(box_infos):
@@ -184,9 +187,11 @@ def classify_boxes(results: list, H: int) -> List[str]:
                 if dist < min_dist:
                     min_dist = dist
                     
-            # If isolated (min_dist > 1.8 * height of box), classify as header/footer
-            if min_dist > 1.8 * info['height']:
-                if y_center < 0.15 * H:
+            # Page numbers and headers are isolated.
+            # We lower the isolation threshold to 1.2 * height to reliably catch page numbers
+            # which are often closer to the body text.
+            if min_dist > 1.2 * info['height']:
+                if in_top_margin:
                     labels[i] = "header"
                 else:
                     labels[i] = "footer"

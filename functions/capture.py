@@ -454,30 +454,20 @@ class WebcamCapturer:
 
             # Apply bleed-through removal if configured
             if enhance_cfg.get('bleed_through_removal', False):
-                print("Applying background subtraction and adaptive thresholding to remove bleed-through...")
+                print("Applying background subtraction and grayscale normalization to remove bleed-through...")
                 bt_cfg = enhance_cfg.get('bleed_through', {})
                 k_size = int(bt_cfg.get('kernel_size', 21))
-                block_size = int(bt_cfg.get('block_size', 15))
-                c_value = int(bt_cfg.get('c_value', 10))
                 
-                # Make kernel size and block size odd
+                # Make kernel size odd
                 if k_size % 2 == 0: k_size += 1
-                if block_size % 2 == 0: block_size += 1
                 
                 # 1. Morphological dilation to estimate background
                 kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
                 background = cv2.dilate(stacked_scaled, kernel)
                 
-                # 2. Subtract background and invert
-                diff = cv2.absdiff(stacked_scaled, background)
-                diff_inverted = cv2.bitwise_not(diff)
-                
-                # 3. Adaptive Thresholding
-                stacked_scaled = cv2.adaptiveThreshold(
-                    diff_inverted, 255, 
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                    cv2.THRESH_BINARY, block_size, c_value
-                )
+                # 2. Normalize by dividing original by background to remove bleed-through/shading
+                # This preserves continuous grayscale text edges for subsequent sharpening/CLAHE
+                stacked_scaled = cv2.divide(stacked_scaled, background, scale=255)
 
             # Apply sharpening if enabled in configuration
             t0 = time.time()

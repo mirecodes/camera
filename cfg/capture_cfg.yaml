@@ -25,8 +25,8 @@ image:
   preprocess: true
   crop:
     enabled: false  # Disabled by default, enable for book margin cropping
-    width_pct: 100.0
-    height_pct: 100.0
+    width_pct: 80.0
+    height_pct: 80.0
 
 # Image Enhancement & Quality Settings
 enhancement:
@@ -67,4 +67,4 @@ layout:
 
 # Development & Offline Testing Settings
 development:
-  reprocess_latest: true  # If true, re-run OCR & crop pipeline on the latest captured raw.png instead of camera stream
+  reprocess_latest: false  # If true, re-run OCR & crop pipeline on the latest captured raw.png instead of camera stream
